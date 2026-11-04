@@ -1,23 +1,23 @@
-# 官方 Codex 执行器
+# 执行器与维护
 
-优先使用整合版的 codex_delegate / codex_status 工具，负责同一 Agents 侧栏中的记录。仅当用户接受没有侧栏的方式时，直接调用脚本。
+优先使用已激活流程的原生工具；直接脚本模式只用于明确接受无侧栏的用户，不能用来绕过 off/manual 门禁。
 
-安装器把脚本放在 `~/.claude/skills/savvy-codex/skills/codex-worker/scripts/codex_delegate.py`。Python 需要 3.10+，无需第三方依赖。不要复制账号令牌；脚本要求官方 CLI 显示 ChatGPT 登录，不使用 API key。
+脚本在 `~/.claude/skills/savvy-codex/skills/codex-worker/scripts/codex_delegate.py`。Python 3.10+，标准库即可。原生设置 `pythonPath` 是单个解释器路径或名称（支持空格，不加引号或 `-3` 参数），其次看 SAVVY_CODEX_PYTHON；Windows 默认 python，其他系统 python3。pluginRoot/helperPath 可覆盖安装路径，对应 SAVVY_CODEX_PLUGIN_ROOT / SAVVY_CODEX_HELPER；默认 CLAUDE_PLUGIN_ROOT 或个人 skills-dir。
 
-原生插件设置提供 `pythonPath`（单个解释器路径或名称，不带命令参数）、`pluginRoot`（插件根目录）、`helperPath`（执行脚本完整路径）。设置值优先，其次分别读取 `SAVVY_CODEX_PYTHON`、`SAVVY_CODEX_PLUGIN_ROOT`、`SAVVY_CODEX_HELPER`。未配置时 Windows 使用 PATH 中的 `python`，其他系统使用 `python3`；脚本路径先看 `CLAUDE_PLUGIN_ROOT`，再使用上述 skills-dir 位置。解释器路径支持空格，不要在设置里额外加引号，也不要填入 `py -3` 这种多参数命令。命令行手工安装仍可以使用 `py -3 scripts/install.py`。
+在仓库目录内：
 
-PowerShell 示例（Python 可换为本机解释器路径）：
-
-```powershell
-$worker = Join-Path $HOME '.claude/skills/savvy-codex/skills/codex-worker/scripts/codex_delegate.py'
-python $worker catalog --cached
-python $worker run --workspace 'C:/projects/example' --packet "$HOME/.claude/codex-worker-runs/requests/task.json" --model gpt-6.1-sol --effort medium --permission read-only --approval never
+```sh
+python skills/codex-worker/scripts/codex_delegate.py doctor
+python skills/codex-worker/scripts/codex_delegate.py catalog --cached
+python skills/codex-worker/scripts/codex_delegate.py catalog --refresh
+python skills/codex-worker/scripts/codex_delegate.py cleanup --workspace /absolute/project/path --days 30 --dry-run
+python skills/codex-worker/scripts/codex_delegate.py cleanup --workspace /absolute/project/path --days 30
 ```
 
-模型名是示例；先用 catalog 检查账号支持的模型和 effort。任务内容写入 JSON，不拼入 shell。
+doctor/cached catalog 不发起推理；refresh 仅显式刷新账号模型目录。CLI 参数/登录不兼容时，按错误提示更新官方 CLI 或重新登录；不复制认证令牌，不改 API 计费来源。
 
-实施模式使用 `--permission workspace-write --approval auto-review`，要求任务包 `kind=implement`、`authorization.write_intent=true` 且用户已授权修改。权限不扩大任务范围。
+run/start 需要 --workspace、--packet、--model、--effort，模型/effort 必须来自当前 catalog；只读用 --permission read-only --approval never，已授权实施用 --permission workspace-write --approval auto-review。写入授权在任务包中声明。所有任务在独立输入副本执行，实际交付通过 scope 检查后留在记录目录；负责人核验补丁后整合。
 
-`start` 后台运行并返回任务编号；`status` 读取真实状态，`wait` 用程序等待。参数以 `--help` 为准。不要让模型反复轮询或在没有结果时宣称完成。
+start 返回任务编号，status 读真实状态，wait 用程序等待，不应让模型循环查询。失败保持原记录；后续尝试记录 parent_job、attempt，独立审查记录 review_of 与 author_provider。详细字段与参数以脚本 --help 和工具 schema 为准。
 
-每项任务保留任务包、模型、effort、原因、事件、结果及文件列表。记录含实际项目内容，请留在本机。额度未知时不猜百分比，不把 API 等价价格当订阅费用。
+cleanup 只处理指定项目过期且已终结的记录，默认保留 30 天；活动/未知/越界或链接路径受保护。Windows 路径可用 `C:/projects/example`。先 dry-run 核对待清理记录，必要结果另存后再删除。原生工具 `codex_cleanup` 需要 workspace，dry_run 默认 true；实际删除要明确传 false。清理属于本机文件维护，不调用模型。不要手动删除仍在运行的目录。

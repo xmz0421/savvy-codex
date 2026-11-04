@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""Install a local checkout into Claude Code's verified skills-dir layout.
+"""Install or remove Savvy Codex, with a local, inference-free readiness check.
 
-Uses only Python's standard library. Never invokes Claude, Codex, or a model.
+Only the three documented plugin flags are changed in Claude settings. Plugin
+preferences belong to the host's userConfig storage and are never synthesized
+or overwritten by this installer.
 """
 from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
+import subprocess
 import sys
 import tempfile
 
@@ -18,54 +23,78 @@ import tempfile
 CORE = (".claude-plugin", "skills", "agents", "hooks", "types", "LICENSE", "NOTICE")
 START = "<!-- BEGIN SAVVY-CODEX-DELEGATION -->"
 END = "<!-- END SAVVY-CODEX-DELEGATION -->"
-WORKFLOW = "\n".join((
-    START,
-    "## Savvy Codex default workflow",
-    "Load the savvy-codex:savvy-flow skill as the default workflow for project tasks.",
-    "Claude leads context, planning, integration, and acceptance. Use Claude and/or",
-    "Codex according to the task; simple tasks may be completed directly. Delegate",
-    "independent work only when useful, with clear ownership. Select and explain",
-    "the model and effort for each delegation based on the task and available models.",
-    "This preference does not require calling both models for every task. Honor",
-    "the user's current instructions and authorization; never change provider,",
-    "credentials, or global model settings to implement this workflow.",
-    END,
-))
+IDENTITY = "savvy-codex@skills-dir"
+RECEIPT_NAME = ".savvy-codex-install.json"
+RECEIPT_OWNER = "savvy-codex-installer"
+PLUGIN_FLAGS = {IDENTITY: True, "savvy-flow@claude-kit": False, "savvy-progress@claude-kit": False}
 
 
-def workflow_text(original: str) -> str:
-    """Replace our marked paragraph, preserving all surrounding user content."""
-    if START in original or END in original:
-        if original.count(START) != 1 or original.count(END) != 1:
-            raise ValueError("CLAUDE.md has incomplete or duplicate workflow markers")
-        start = original.index(START)
-        end = original.index(END) + len(END)
-        if original.index(END) < start:
-            raise ValueError("CLAUDE.md has reversed workflow markers")
-        return original[:start] + WORKFLOW + original[end:]
-    return original + ("\n\n" if original and not original.endswith("\n") else "\n" if original else "") + WORKFLOW + "\n"
+class NotReadyError(ValueError):
+    """Readiness failed before any installation changes were made."""
+
+    def __init__(self, message: str, doctor: dict | None = None):
+        super().__init__(message)
+        self.doctor = doctor or {}
+        self.installed = False
+
+
+def absolute(path: Path) -> Path:
+    # resolve() would conceal a symlink/junction supplied by the caller.
+    return Path(os.path.abspath(path.expanduser()))
+
+
+def check_path(path: Path) -> None:
+    """Reject links and Windows junctions in a target and every ancestor."""
+    for part in (path, *path.parents):
+        try:
+            info = part.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+            raise ValueError(f"Refusing a symlink or junction path: {part}")
+
+
+def check_tree(path: Path) -> None:
+    check_path(path)
+    if path.is_dir():
+        for parent, directories, files in os.walk(path, followlinks=False):
+            for name in directories + files:
+                check_path(Path(parent) / name)
 
 
 def read_regular(path: Path) -> bytes | None:
-    if path.is_symlink():
-        raise ValueError(f"Refusing to overwrite a symlink: {path}")
+    check_path(path)
+    if path.exists() and not path.is_file():
+        raise ValueError(f"Expected a regular file: {path}")
     return path.read_bytes() if path.exists() else None
 
 
-def same_tree(left: Path, right: Path) -> bool:
-    if not right.is_dir():
-        return False
-    def files(root: Path) -> dict[str, bytes | None]:
-        result = {}
-        for path in root.rglob("*"):
-            if path.is_symlink():
-                return {"<symlink>": None}
-            result[str(path.relative_to(root))] = None if path.is_dir() else path.read_bytes()
-        return result
-    return files(left) == files(right)
+def json_bytes(value: dict) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def read_object(path: Path) -> tuple[bytes | None, dict]:
+    original = read_regular(path)
+    value = json.loads(original.decode("utf-8-sig")) if original is not None else {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{path.name} must contain an object")
+    return original, value
+
+
+def without_workflow(original: bytes | None) -> bytes | None:
+    """Remove only our former global instruction block, preserving other bytes."""
+    if original is None:
+        return None
+    value = original.decode("utf-8")
+    if START not in value and END not in value:
+        return original
+    if value.count(START) != 1 or value.count(END) != 1 or value.index(END) < value.index(START):
+        raise ValueError("CLAUDE.md has incomplete, duplicate, or reversed Savvy workflow markers; no files changed")
+    return (value[:value.index(START)] + value[value.index(END) + len(END):]).encode("utf-8")
 
 
 def atomic_write(path: Path, data: bytes) -> None:
+    check_path(path)
     fd, temporary = tempfile.mkstemp(prefix=".savvy-codex-", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as stream:
@@ -76,41 +105,152 @@ def atomic_write(path: Path, data: bytes) -> None:
             os.unlink(temporary)
 
 
-def install(source: Path, claude_home: Path, enable_default_workflow: bool = False) -> dict:
-    source = source.expanduser().resolve()
-    claude_home = claude_home.expanduser().resolve()
+def file_hashes(root: Path) -> dict[str, str]:
+    if not root.is_dir():
+        return {}
+    result = {}
+    for path in root.rglob("*"):
+        relative = path.relative_to(root)
+        if path.is_file() and path.name != ".install-info.json" and "__pycache__" not in relative.parts and path.suffix != ".pyc":
+            result[relative.as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return dict(sorted(result.items()))
+
+
+def same_tree(left: Path, right: Path) -> bool:
+    return right.is_dir() and file_hashes(left) == file_hashes(right) and read_regular(left / ".install-info.json") == read_regular(right / ".install-info.json")
+
+
+def read_receipt(path: Path) -> tuple[bytes | None, dict | None]:
+    original, receipt = read_object(path)
+    if original is None:
+        return None, None
+    if receipt.get("owner") != RECEIPT_OWNER or receipt.get("schema_version") != 2 or receipt.get("plugin_identity") != IDENTITY:
+        raise ValueError("Unrecognized installation receipt; refusing to guess which settings are owned")
+    if receipt.get("status") not in ("installed", "uninstalled"):
+        raise ValueError("Installation receipt has an invalid status")
+    flags = receipt.get("plugin_flags", {})
+    if not isinstance(flags, dict) or any(key not in PLUGIN_FLAGS for key in flags):
+        raise ValueError("Installation receipt has invalid owned plugin flags")
+    for key, value in flags.items():
+        if not isinstance(value, dict) or type(value.get("before_exists")) is not bool or value.get("after") is not PLUGIN_FLAGS[key]:
+            raise ValueError("Installation receipt has invalid plugin restoration data")
+        if value["before_exists"] and "before" not in value:
+            raise ValueError("Installation receipt is missing a previous plugin flag value")
+    hashes = receipt.get("package_hashes", {})
+    if not isinstance(hashes, dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in hashes.items()):
+        raise ValueError("Installation receipt has invalid package hashes")
+    return original, receipt
+
+
+def doctor_preflight(source: Path) -> dict:
+    if sys.version_info < (3, 10):
+        raise NotReadyError("Python 3.10 or later is required")
+    helper = source / "skills" / "codex-worker" / "scripts" / "codex_delegate.py"
+    if not helper.is_file():
+        raise NotReadyError(f"Bundled doctor is missing: {helper}")
+    try:
+        process = subprocess.run([sys.executable, str(helper), "doctor", "--json"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise NotReadyError(f"Readiness check could not finish: {error}") from error
+    try:
+        result = json.loads(process.stdout)
+    except ValueError as error:
+        raise NotReadyError("Bundled doctor returned invalid JSON; installation was not changed") from error
+    if not isinstance(result, dict) or result.get("ready") is not True or process.returncode != 0:
+        detail = (result.get("next_action") or result.get("error")) if isinstance(result, dict) else None
+        raise NotReadyError(str(detail or "Check official Codex CLI, ChatGPT login, version, features, and model catalog."), result if isinstance(result, dict) else None)
+    return result
+
+
+def paths_for(claude_home: Path) -> tuple[Path, Path, Path, Path]:
     destination = claude_home / "skills" / "savvy-codex"
+    paths = (destination, claude_home / "settings.json", claude_home / "CLAUDE.md", claude_home / RECEIPT_NAME)
+    for path in (*paths, claude_home / "backups" / "savvy-codex"):
+        check_path(path)
+    if destination.exists() and not destination.is_dir():
+        raise ValueError("Installed package path exists and is not a directory")
+    check_tree(destination)
+    return paths
+
+
+def settings_plugins(settings: dict) -> dict:
+    plugins = settings.get("enabledPlugins", {})
+    if not isinstance(plugins, dict):
+        raise ValueError("enabledPlugins must contain an object")
+    return plugins
+
+
+def make_backup(claude_home: Path, files: dict[str, bytes | None], destination: Path, package: bool) -> Path:
+    backup_root = claude_home / "backups" / "savvy-codex"
+    check_path(backup_root)
+    backup_root.mkdir(parents=True, exist_ok=True)
+    backup = Path(tempfile.mkdtemp(prefix=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-"), dir=backup_root))
+    for name, data in files.items():
+        if data is not None:
+            (backup / name).write_bytes(data)
+    if package and destination.exists():
+        shutil.copytree(destination, backup / "savvy-codex")
+    return backup
+
+
+def install(source: Path, claude_home: Path, enable_default_workflow: bool = False, *, skip_doctor: bool = False) -> dict:
+    source, claude_home = absolute(source), absolute(claude_home)
+    check_path(source)
+    destination, settings_path, claude_path, receipt_path = paths_for(claude_home)
     if source == destination or source in destination.parents or destination in source.parents:
         raise ValueError("Source checkout and installed package must be separate directories")
     for name in CORE:
         if not (source / name).exists():
             raise ValueError(f"Source is missing required component: {name}")
-    # Reject links before copying, rather than following a checkout outside its root.
-    for name in CORE:
-        component = source / name
-        if component.is_symlink() or (component.is_dir() and any(p.is_symlink() for p in component.rglob("*"))):
-            raise ValueError(f"Source component contains a symlink: {name}")
-    if destination.is_symlink() or destination.parent.is_symlink():
-        raise ValueError("Installed package and skills directory must not be symlinks")
-    if destination.exists() and not destination.is_dir():
-        raise ValueError("Installed package path exists and is not a directory")
+        check_tree(source / name)
+    _, manifest = read_object(source / ".claude-plugin" / "plugin.json")
+    if manifest.get("name") != "savvy-codex" or not isinstance(manifest.get("version"), str):
+        raise ValueError("Source manifest must identify savvy-codex and its version")
+    old_settings, settings = read_object(settings_path)
+    plugins = settings_plugins(settings)
+    old_receipt, previous = read_receipt(receipt_path)
+    old_claude = read_regular(claude_path)
+    new_claude = without_workflow(old_claude)
+    claude_changed = old_claude != new_claude
+    # Complete every read/validation before staging, backups, settings or mkdir.
+    try:
+        doctor = None if skip_doctor else doctor_preflight(source)
+    except NotReadyError as error:
+        error.installed = destination.exists()
+        raise
+    warnings = []
+    if skip_doctor:
+        warnings.append("Doctor explicitly skipped; installed but readiness is unverified. Run the bundled doctor before delegation.")
+    if enable_default_workflow:
+        warnings.append("--enable-default-workflow is deprecated. Choose auto in plugin settings if wanted; the default mode is manual. No global workflow is added.")
+    if claude_changed:
+        warnings.append("Removed the previous global Savvy workflow block; choose manual/auto/off in plugin settings.")
 
-    settings_path = claude_home / "settings.json"
-    old_settings = read_regular(settings_path)
-    settings = json.loads(old_settings.decode("utf-8-sig")) if old_settings is not None else {}
-    if not isinstance(settings, dict):
-        raise ValueError("settings.json must contain an object")
-    plugins = settings.setdefault("enabledPlugins", {})
-    if not isinstance(plugins, dict):
-        raise ValueError("enabledPlugins must contain an object")
-    desired = {"savvy-codex@skills-dir": True, "savvy-flow@claude-kit": False, "savvy-progress@claude-kit": False}
-    settings_changed = old_settings is None or any(plugins.get(k) is not v for k, v in desired.items())
-    plugins.update(desired)
-    new_settings = (json.dumps(settings, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    claude_path = claude_home / "CLAUDE.md"
-    old_claude = read_regular(claude_path) if enable_default_workflow else None
-    new_claude = workflow_text(old_claude.decode("utf-8-sig") if old_claude is not None else "").encode("utf-8") if enable_default_workflow else None
-    claude_changed = enable_default_workflow and old_claude != new_claude
+    owned = {}
+    previous_flags = previous.get("plugin_flags", {}) if previous and previous["status"] == "installed" else {}
+    for key, desired in PLUGIN_FLAGS.items():
+        prior = previous_flags.get(key)
+        if prior and key in plugins and plugins[key] is prior["after"]:
+            owned[key] = prior
+        elif key not in plugins or plugins[key] is not desired:
+            owned[key] = {"before_exists": key in plugins, "after": desired}
+            if key in plugins:
+                owned[key]["before"] = plugins[key]
+    settings_changed = any(key not in plugins or plugins[key] is not value for key, value in PLUGIN_FLAGS.items())
+    if settings_changed:
+        settings["enabledPlugins"] = {**plugins, **PLUGIN_FLAGS}
+    new_settings = json_bytes(settings)
+    custom_files = []
+    if destination.exists():
+        actual_hashes = file_hashes(destination)
+        expected_hashes = previous.get("package_hashes") if previous and previous["status"] == "installed" else None
+        if expected_hashes is None:
+            warnings.append("Existing package has no managed hash receipt; its complete contents will be backed up before replacement.")
+            custom_files = sorted(actual_hashes)
+        else:
+            custom_files = sorted(key for key in actual_hashes.keys() | expected_hashes.keys() if actual_hashes.get(key) != expected_hashes.get(key))
+        if custom_files:
+            warnings.append("Local package changes detected and backed up before update: " + ", ".join(custom_files))
 
     claude_home.mkdir(parents=True, exist_ok=True)
     backup = None
@@ -124,21 +264,15 @@ def install(source: Path, claude_home: Path, enable_default_workflow: bool = Fal
                 shutil.copytree(component, staged / name, ignore=shutil.ignore_patterns(*ignored))
             else:
                 shutil.copy2(component, staged / name)
-        receipt = {"source": str(source), "installer_python": sys.executable, "plugin_identity": "savvy-codex@skills-dir"}
-        (staged / ".install-info.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        hashes = file_hashes(staged)
+        receipt = {"owner": RECEIPT_OWNER, "schema_version": 2, "status": "installed", "source": str(source), "destination": str(destination), "installer_python": sys.executable, "plugin_identity": IDENTITY, "plugin_version": manifest["version"], "plugin_flags": owned, "package_hashes": hashes}
+        atomic_write(staged / ".install-info.json", json_bytes(receipt))
+        new_receipt = json_bytes(receipt)
         package_changed = not same_tree(staged, destination)
-        changes = package_changed or settings_changed or claude_changed
+        receipt_changed = old_receipt != new_receipt
+        changes = package_changed or settings_changed or claude_changed or receipt_changed
         if changes:
-            backup_root = claude_home / "backups" / "savvy-codex"
-            backup_root.mkdir(parents=True, exist_ok=True)
-            backup = Path(tempfile.mkdtemp(prefix=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-"), dir=backup_root))
-            # Preserve exact original bytes and the complete old package before writing.
-            if settings_changed and old_settings is not None:
-                (backup / "settings.json").write_bytes(old_settings)
-            if claude_changed and old_claude is not None:
-                (backup / "CLAUDE.md").write_bytes(old_claude)
-            if package_changed and destination.exists():
-                shutil.copytree(destination, backup / "savvy-codex", symlinks=True)
+            backup = make_backup(claude_home, {"settings.json": old_settings, "CLAUDE.md": old_claude if claude_changed else None, RECEIPT_NAME: old_receipt}, destination, package_changed)
             if package_changed:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 if destination.exists():
@@ -148,26 +282,110 @@ def install(source: Path, claude_home: Path, enable_default_workflow: bool = Fal
                 atomic_write(settings_path, new_settings)
             if claude_changed:
                 atomic_write(claude_path, new_claude)
-    return {"destination": str(destination), "backup": str(backup) if backup else None, "changed": bool(changes), "installer_python": sys.executable}
+            if receipt_changed:
+                atomic_write(receipt_path, new_receipt)
+    return {"destination": str(destination), "backup": str(backup) if backup else None, "changed": bool(changes), "installer_python": sys.executable, "ready": not skip_doctor, "status": "ready" if not skip_doctor else "installed_but_not_ready", "doctor": doctor, "warnings": warnings, "local_changes": custom_files}
 
 
-def main() -> int:
+def package_is_ours(destination: Path) -> bool:
+    if not destination.exists():
+        return False
+    _, info = read_object(destination / ".install-info.json")
+    if info.get("plugin_identity") == IDENTITY:
+        return True
+    _, manifest = read_object(destination / ".claude-plugin" / "plugin.json")
+    return manifest.get("name") == "savvy-codex"
+
+
+def uninstall(claude_home: Path) -> dict:
+    claude_home = absolute(claude_home)
+    destination, settings_path, claude_path, receipt_path = paths_for(claude_home)
+    old_settings, settings = read_object(settings_path)
+    plugins = settings_plugins(settings)
+    old_receipt, receipt = read_receipt(receipt_path)
+    old_claude = read_regular(claude_path)
+    new_claude = without_workflow(old_claude)
+    warnings, restored, skipped = [], [], []
+    remove_package = package_is_ours(destination)
+    if destination.exists() and not remove_package:
+        warnings.append("Package path is not identified as Savvy Codex; preserved it. Disable/remove any custom installation manually.")
+    previous_flags = receipt.get("plugin_flags", {}) if receipt and receipt["status"] == "installed" else {}
+    updated_plugins = dict(plugins)
+    for key, owned in previous_flags.items():
+        if key not in plugins or plugins[key] is not owned["after"]:
+            skipped.append(key)
+            continue
+        if owned["before_exists"]:
+            updated_plugins[key] = owned["before"]
+        else:
+            updated_plugins.pop(key, None)
+        restored.append(key)
+    # Without owned history, only disable this plugin. Never guess the old
+    # Savvy flag values or overwrite a later user edit after an uninstall.
+    if not receipt or receipt["status"] == "installed" and IDENTITY not in previous_flags:
+        if plugins.get(IDENTITY) is True:
+            updated_plugins[IDENTITY] = False
+        warnings.append("No owned previous value for this plugin flag; conservatively disabled Savvy Codex. Re-enable the original Savvy plugins manually if wanted.")
+    if skipped:
+        warnings.append("Preserved plugin flags changed since installation: " + ", ".join(skipped))
+    # JSON distinguishes 0/false and 1/true, whereas Python dict equality does
+    # not. Preserve even unusual pre-install values exactly when restoring.
+    settings_changed = json_bytes(updated_plugins) != json_bytes(plugins)
+    if settings_changed:
+        settings["enabledPlugins"] = updated_plugins
+    claude_changed = old_claude != new_claude
+    completed = {**receipt, "status": "uninstalled"} if receipt else None
+    new_receipt = json_bytes(completed) if completed else None
+    receipt_changed = old_receipt != new_receipt
+    changes = remove_package or settings_changed or claude_changed or receipt_changed
+    backup = None
+    if changes:
+        claude_home.mkdir(parents=True, exist_ok=True)
+        backup = make_backup(claude_home, {"settings.json": old_settings, "CLAUDE.md": old_claude if claude_changed else None, RECEIPT_NAME: old_receipt}, destination, remove_package)
+        if remove_package:
+            shutil.rmtree(destination)
+        if settings_changed:
+            atomic_write(settings_path, json_bytes(settings))
+        if claude_changed:
+            atomic_write(claude_path, new_claude)
+        if receipt_changed:
+            atomic_write(receipt_path, new_receipt)
+    return {"destination": str(destination), "backup": str(backup) if backup else None, "changed": bool(changes), "status": "uninstalled", "warnings": warnings, "restored_flags": restored, "preserved_flags": skipped}
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[1], help="Local plugin checkout (default: this repository)")
+    parser.add_argument("--source", type=Path, default=Path(__file__).absolute().parents[1], help="Local plugin checkout (default: this repository)")
     parser.add_argument("--claude-home", type=Path, default=Path.home() / ".claude", help="Claude configuration directory")
-    parser.add_argument("--enable-default-workflow", action="store_true", help="Add the marked default workflow paragraph to global CLAUDE.md")
-    args = parser.parse_args()
+    parser.add_argument("--enable-default-workflow", action="store_true", help="Deprecated compatibility option; removes old global workflow block. Select auto in plugin settings.")
+    parser.add_argument("--skip-doctor", action="store_true", help="Explicit offline/test installation; readiness stays unverified. Never used by default.")
+    parser.add_argument("--uninstall", action="store_true", help="Back up and remove this package, restore owned plugin flags, keep run records/preferences")
+    args = parser.parse_args(argv)
     try:
-        result = install(args.source, args.claude_home, args.enable_default_workflow)
+        result = uninstall(args.claude_home) if args.uninstall else install(args.source, args.claude_home, args.enable_default_workflow, skip_doctor=args.skip_doctor)
+    except NotReadyError as error:
+        status = "Installed but not ready; update refused" if error.installed else "Not installed: not ready"
+        print(f"{status}. {error}", file=sys.stderr)
+        print("No installation or global settings changes were made. Doctor does not run a model.", file=sys.stderr)
+        return 2
     except (OSError, ValueError) as error:
-        print(f"Installation failed: {error}", file=sys.stderr)
+        print(f"{'Uninstall' if args.uninstall else 'Installation'} failed: {error}", file=sys.stderr)
         return 1
-    print("Installed: " + result["destination"] if result["changed"] else "Already up to date: " + result["destination"])
+    if args.uninstall:
+        print(("Uninstalled: " if result["changed"] else "Already uninstalled: ") + result["destination"])
+    elif result["ready"]:
+        print(("Installed and ready: " if result["changed"] else "Already up to date and ready: ") + result["destination"])
+    else:
+        print("Installed but not ready (doctor skipped): " + result["destination"])
     if result["backup"]:
         print("Original files backed up: " + result["backup"])
-    print("Installer Python: " + result["installer_python"])
-    print("This interpreter is recorded in .install-info.json; runtime Python uses PATH or explicit plugin configuration.")
-    print("Restart Claude Code to load savvy-codex@skills-dir.")
+    for warning in result["warnings"]:
+        print("Note: " + warning)
+    if not args.uninstall:
+        print("Installer Python: " + result["installer_python"])
+        print("Restart Claude Code to load savvy-codex@skills-dir. Plugin mode defaults to manual; preferences are controlled by plugin settings.")
+    else:
+        print("Run records, user preferences, and backups were preserved. Restart Claude Code to unload the plugin.")
     return 0
 
 

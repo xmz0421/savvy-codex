@@ -1,117 +1,71 @@
 ---
 name: savvy-flow
-description: Default Claude-led project workflow with Claude and Codex workers in one Savvy Agents panel. Apply automatically to substantive project work without waiting for a command; choose each worker, Codex model and reasoning effort for the task, then inspect actual results.
+description: Optional Claude-led collaboration with Claude and Codex workers in one Agents panel. Check workflow_control before dispatch. Manual mode needs user activation; off forbids dispatch; auto applies only when selected by the user. Choose whether delegation is worth its cost.
 argument-hint: <task description>
 ---
 
 # Savvy Flow
 
-You are the **orchestrator**. You think, plan, decide, and review. Workers execute. Never do a worker's job yourself, and never let a worker do yours.
+Claude owns the user's goal, context, decomposition, review and integration. Claude may also do the work directly. This skill never enables itself and never requires both providers for every task.
 
-Task: use $ARGUMENTS when explicitly invoked; otherwise use the user's current project request. This is the default project workflow: do not ask the user to enable it or wait for a slash command.
+## 1. Respect the mod switch
 
-## Codex integration
+Discover `mcp__savvy-codex__workflow_control` and call its status action before any Savvy dispatch. The runtime is authoritative:
 
-This local version combines Savvy Flow, its progress/Agents panel, and the `codex-worker` skill. Claude owns the user's goal and final integration. Prefer a direct Codex worker for suitable independent code investigation, implementation, tests, patch review, or structured cleanup; retain the existing Claude workers when their context or capabilities fit better. Do not create a Claude wrapper subagent just to launch Codex.
+- `off`: no new Savvy workers. Continue ordinary work directly; reading existing tasks is allowed.
+- `manual` without an active run: do not dispatch. Explain that the user can press Start in the Agents pane or run `/savvy-start`, then give the task. Loading this skill is not activation. Never change the mode or run a shell fallback to evade this gate.
+- Active manual run or user-selected `auto`: use this workflow for the current authorized goal. Close a manual run with workflow_control finish after the goal is handled; do not silently reuse it for unrelated work.
 
-For each Codex delegation, read the bundled [codex-worker skill](../codex-worker/SKILL.md), decide model and effort separately, and record the task-specific reason. Straightforward work can use Terra medium or Sol medium; demanding analysis can use Astra high/xhigh/max or Sol max. These are choices for the task, not a permanent global maximum.
+`/savvy-mode off|manual|auto` and the panel control the current session. The plugin's workflowMode setting chooses the default for new sessions. Opening the pane and changing a mode never launches a model. If tools are unavailable, report that the mod is not loaded; continue ordinary work without an invisible Codex fallback.
 
-Use `mcp__savvy-codex__codex_delegate` and `mcp__savvy-codex__codex_status`. They place the real external worker in this same Agents pane, with the selected model/effort, actual state and files. The Codex CLI must use its own ChatGPT login; no Claude CLI or extra Claude proxy agent is launched. Ordinary small replies need no delegation. User instructions to disable delegation take precedence.
+## 2. Decide whether to delegate
 
-## 0. Preconditions
+Estimate context transfer, runtime and review cost before splitting. A low-risk change in at most 2 files and roughly 60 changed lines is normally done by the lead. These are heuristics, not quotas: a one-line concurrency or authorization change can still need independent review. Do not create a worker just to read one file or execute one known test command.
 
-- The flow is designed for a strong orchestrator model at high effort (Fable high is the reference setup). Do not try to detect or verify the session's model or effort — you cannot see the effort level. Whatever the session runs on is the user's deliberate choice; just orchestrate.
-- When choosing a Claude worker, verify that the needed tier exists: `savvy-fable`, `savvy-heavy`, `savvy-careful`, `savvy-medium`, `savvy-light` (or namespaced `savvy-codex:savvy-careful`, etc.). A missing Claude tier does not prevent an available Codex worker from handling a suitable task. If the integrated Codex tool is not loaded, follow the skill's documented script fallback and report that this session has no live panel support.
+Delegate when an independent investigation, implementation, or review has a clear result and is likely to save effort or catch a material error. Keep summaries short. Do not expand a small task into a spec approval ceremony or exhaustive test suite.
 
-## Progress bar
+For substantial work, show a compact plan: owner/provider, task, actual model/effort and reason, dependencies, file scope, verification and review cost. Ask only when missing information materially changes the outcome.
 
-If the tool `mcp__savvy-codex__progress` appears among your tools, including as a deferred tool, it is available: a deferred tool only needs loading first with ToolSearch (`select:mcp__savvy-codex__progress`). Keep it current; skip silently only if the tool is absent or ToolSearch does not find it. Call it:
-- after presenting the plan: `title` (a few words), `total` (number of worker tasks), `tasks` (`[{ title, tier, after }]` in plan order; `tier` without the `savvy-` prefix, `after` the numbers of the tasks it waits for), `phase: "delegate"` (or `"design"` while in section 2);
-- each time a task is accepted in review: `done` (accepted so far); switch `phase` to `"review"` while reviewing;
-- if re-planning changes the tasks: the new `tasks` and `total`;
-- once at close: `finished: true`.
+## 3. Choose current models and effort
 
-For Claude workers, pass the task's `title` verbatim as the Agent tool's `description`. For Codex, keep the same title in the task goal/description. Include provider/model/effort for Codex plan items when the progress tool schema supports these fields. Never label a planned GPT worker as an Opus tier merely to fit a schema.
+For Codex, first read the account catalog through `mcp__savvy-codex__codex_catalog` (refresh defaults false) or the bundled executor. Choose an exact supported model id and supported effort from that result. Do not copy an old example, invent a model, silently substitute one or refresh the catalog by running a model.
 
-## 1. Understand and plan (orchestrator only)
+Use a lower-cost available candidate with medium effort for clear mechanical work; a general coding candidate for implementation; stronger reasoning/high effort for uncertainty, complex invariants or difficult review. Reserve the highest effort for stages that justify it. Record the concrete reason and account availability; model choice and effort are separate decisions. No provider is inherently the planner or reviewer for every task.
 
-1. Read whatever is needed to understand the request in context: relevant files, CLAUDE.md, recent git history. Use an Explore subagent (haiku/sonnet) only for wide searches.
-   - If the working directory has no project (empty, or no source/manifests/CLAUDE.md), this is a **new project**: follow section 1a first, then continue here from step 3 using PLAN.md as the task list.
-2. Decide whether the task **touches design** (any visible UI, layout, visual hierarchy, copy that users see, interaction flow, colors/typography/spacing). If yes → go to section 2 before any implementation.
-3. Break the work into **tasks** with:
-   - a clear, self-contained brief (what, where, constraints, definition of done, how to verify);
-   - explicit dependencies between tasks;
-   - a **tier** per task (section 3).
-4. Present a compact plan with task, provider, selected model/effort, and dependency order. Ask only when missing information materially changes the work; otherwise proceed with already authorized tasks.
+For Claude, check the actual Agent tool schema and available worker definitions. The bundled tier names are effort/role presets and inherit the lead's model unless explicitly overridden. Select an available model per invocation when supported; report actual resolved model/effort. Do not interpret a tier name as proof of a particular model or price.
 
-## 1a. New project (greenfield)
+## 4. Dispatch with ownership
 
-No delegation until the spec is approved. Workers cannot see this chat, so the spec must live in files.
+- Codex: read [codex-worker](../codex-worker/SKILL.md), write a bounded JSON packet, then use codex_delegate directly. No extra Claude wrapper agent.
+- Claude: use a bundled `savvy-codex:savvy-*` worker with a self-contained brief. Put `KIND: implement|review|inspect`, `REVIEW_OF: <source task id>` for a review, `AUTHOR_PROVIDER: claude|codex`, allowed paths, expected output, and checks in the brief. A review is read-only.
+- Writers work in independent staged workspaces or git worktrees. Read current dirty content as input where required; a clean-HEAD worktree alone omits dirty edits, so explicitly transfer the relevant diff. Never reset the source project. Never have two writers modify the main checkout together.
+- A Codex implementation produces files and a patch in its scoped execution snapshot. It does not update the main project automatically. Inspect the actual patch and file list, review, then apply through the lead's authorized tools. Check that source files have not changed since dispatch; resolve conflicts visibly.
+- Include only necessary context and authorized inputs, including test configuration/dependencies when needed. If the snapshot lacks an input, request a precise scope expansion instead of exploring the original project behind the boundary.
+- Default synchronous calls return actual results. Background calls are useful when independent work remains; wait once when the result is needed. State refresh and ordinary program waiting do not require model polling.
 
-1. **Git**: if the directory is not a git repository, run `git init` immediately, without asking. Add a stack-appropriate `.gitignore`. Make the first commit once the docs below exist; commit again after the scaffold is accepted and after each accepted task. Never push without being asked.
-2. Clarify what is not derivable from the request: platform/stack, target users, MVP boundary, non-goals, any hard constraints (deadline, hosting, existing accounts). Ask in one batch, not one question per turn.
-3. Write `docs/SPEC.md`: goals, non-goals, stack with versions, architecture (modules and their responsibilities), data model, external integrations, key user flows, definition of done for MVP. Keep it as long as the substance needs and no longer.
-4. Write `docs/PLAN.md`: ordered tasks, each with a one-paragraph brief, tier (section 3), dependencies, and how it is verified. Task 1 is always **scaffold** (project structure, dependencies, build/test/run commands, lint) at Light or Medium tier; nothing runs in parallel with it.
-5. Write `CLAUDE.md` at the project root. It is loaded into every session and every worker, so it must be **as short as possible**: target 20-40 lines, hard cap 60. Only what an agent cannot derive from the code and would otherwise get wrong: stack in one line, the exact build/test/run/lint commands, 3-7 non-obvious conventions, and pointers to `docs/SPEC.md`, `docs/PLAN.md`, `filemap.md`. No project description, no architecture prose, no restating of tooling defaults. If a rule needs a paragraph, it goes to `docs/` and CLAUDE.md links it.
-6. Write `filemap.md` at the project root: one line per directory and per significant file, `path — what lives here / when to touch it`. It is the navigation index for workers; keep it flat and scannable, no prose. Task briefs tell workers to update it when they add or move files; the orchestrator checks it during review.
-7. If the project has UI, do the design pass (section 2) now, before approval: at minimum the main screens/flows as mockups the user can react to. Record the decisions in SPEC.md.
-8. Show the user SPEC.md and PLAN.md in summary form and wait for approval. Edit on feedback; do not start delegating on a partial "sounds fine".
-9. After approval: delegate the scaffold, review it (section 5), commit. Only then fan out the rest of PLAN.md by dependency order.
-10. Every worker brief references `docs/SPEC.md` and the relevant section instead of restating it, plus the exact task paragraph from PLAN.md. Keep PLAN.md updated as tasks are accepted, so a resumed session can continue from it.
+Maintain the progress tool with real planned tasks, providers and dependencies; mark a task accepted only after verification. Do not label GPT tasks as Claude tiers to fit a UI.
 
-## 2. Design (orchestrator only — never delegated)
+## 5. Cross-provider review
 
-Design decisions are yours. Workers never invent UI, with one exception below.
+For a nontrivial implementation, schedule one independent review by the other provider before integration:
 
-- **Small/contained UI** (a component, a state, a screen tweak): decide the design yourself and write it into the worker brief as concrete specs (structure, states, spacing/typography rules, which existing components to reuse).
-- **When the user should see it before code is written** (new screen, flow, or anything ambiguous): show it in chat with the `visualize` widget (mockup/diagram) and get a reaction before delegating.
-- **Bigger or exploratory design** (new screens/flows, landing pages, several variants): run the `design` skill to produce a canvas, let the user pick/tweak, then translate the chosen artboards into implementation briefs.
-- **Delegated design feature (only when the user explicitly asks)**: a targeted design feature (one component, interaction, animation, or visual detail) may go to `savvy-fable`. The brief states the bounds: what may change, which existing components and tokens to stay consistent with, and what is out of scope. You still review the visual result and own acceptance.
-- For frontend styling direction, consult the `frontend-design` skill. For any chart/graph, consult `dataviz` before specifying it.
-- After implementation, the orchestrator reviews the visual result (preview/screenshot/simulator when available) — a worker's "done" does not close a design task.
+- Codex author → a Claude review worker reads the actual exported patch, affected files and test evidence.
+- Claude author → call Codex with workspace set to the author's actual isolated worktree (or a prepared candidate snapshot), not the unchanged main checkout. A `kind: review` packet reads the actual candidate change and tests, with `author_provider: claude` and `review_of` pointing to the author task. Include the candidate diff and relevant baseline in the allowed inputs when needed to explain the change.
 
-## 3. Tiering
+Link the actual task IDs in the pane; do not call a lead reread an independent worker review. A review that has not run stays pending/unknown. If a provider is unavailable, disclose the missing review and obtain a deliberate user decision for changes whose acceptance depends on it; continue unrelated authorized work.
 
-Pick the cheapest tier that will get the task right the first time. Two axes: **model** sets the ceiling of judgment, **effort** sets how much the model checks itself.
+For a trivial, reversible edit, the lead may skip cross-review and state the reason. Do not repeatedly review unchanged patches. Review checks scope, edge cases, reported tests, and material regressions; use actual files, not only the author's summary. After a revision that materially changes behavior, review the new patch once.
 
-| Tier | Agent | Model / effort | Use for |
-|------|-------|----------------|---------|
-| Fable | `savvy-fable` | Fable / high | "Hardest problems": very complex logic (subtle algorithms, concurrency, many interacting states), hard bugs that resist ordinary debugging or survived a Heavy investigation; targeted design features, only when the user asks (section 2) |
-| Heavy | `savvy-heavy` | Opus / xhigh | "Understand and find": unfamiliar or messy code, unclear root cause, non-obvious architecture, large contexts, anything where a wrong first approach is expensive |
-| Careful | `savvy-careful` | Opus / high | "Do it right": the approach is clear but execution is delicate. Multi-file refactors, fixes that must preserve invariants, logic with many edge cases, concurrency |
-| Medium | `savvy-medium` | Opus / medium | Standard feature work, bug fixes with a known cause, changes confined to a few files with clear requirements |
-| Light | `savvy-light` | Opus / low | Mechanical edits, renames, boilerplate, config, small isolated fixes, running builds/tests and reporting |
+## 6. Bounded recovery and completion
 
-Heuristics:
-- Uncertain between two tiers → take the higher one. Exception: Fable is a reserve tier; pick it only when the task clearly meets its criteria, otherwise Heavy.
-- Heavy vs Careful is about the kind of difficulty, not the amount: insight needed → Heavy; thoroughness needed → Careful. A task that needs both is two tasks: Heavy investigates and produces a precise brief, Careful implements it.
-- A task that is mostly investigation with an unclear outcome is Heavy; split "investigate" and "implement" if the investigation result changes the plan.
-- Never delegate final judgment (section 5) to any tier. Design is delegated only as section 2 allows: to `savvy-fable`, on the user's explicit request.
+Read failure_kind, next_action, limitations and verification evidence. Default is no automatic retry, model substitution, API billing switch, or permission escalation.
 
-## 4. Delegate
+- Transient service failure: at most one justified retry, preserving the original record and linking parent_job/attempt.
+- Timeout: narrow the task or deliberately extend the next attempt; show the reason.
+- Quota/model unavailable: report it and choose another available model/provider only within user preferences; record that new choice before dispatch.
+- Auth/version/permission failure: stop that dispatch and fix the prerequisite through authorized tools; do not retry the same denial or bypass the sandbox.
+- Incomplete/invalid result or out-of-scope edits: keep blocked, explain the concrete defect, allow one focused revision; then re-plan instead of looping.
 
-- For Codex, call the integrated delegate tool directly, with a bounded task packet, explicit model and effort. Default synchronous execution returns a result without model polling; use background execution only when the main session has independent work, then wait for the result once when needed.
-- For Claude, use the Agent tool with `subagent_type` exactly as listed (`savvy-careful` or `savvy-codex:savvy-careful`). Run independent tasks in parallel when file ownership and available resources permit it; chain dependent ones. Do not concurrently edit the same files from two workers.
-- Each brief must be self-contained: the worker has no access to this conversation. Include file paths, the decided design specs, constraints from CLAUDE.md that matter, and the exact verification expected.
-- Keep briefs tight. Do not paste the whole plan; paste this task.
-- Do not implement in parallel with workers. While they run, prepare the next briefs or the review checklist.
+The lead verifies the candidate and the review, checks actual diffs, and integrates only accepted work. A worker that could not run a necessary check remains blocked even if the lead later performs that check; identify who actually verified it. Final delivery states results, meaningful checks, review status and remaining limitations. Close the progress and the manual workflow activation.
 
-## 5. Adversarial review (orchestrator only)
-
-Treat every worker report as a claim to be checked, not a fact.
-
-For each returned task:
-1. Read the actual diff/files, not just the report.
-2. Check against the brief: scope creep, missing parts, silent assumptions, design deviations.
-3. Look for what a careful reviewer would catch: edge cases, error paths, broken invariants, regressions in neighbouring code, missing verification.
-4. Re-run the verification yourself when it is cheap (build, tests, a quick preview) or when the report is vague.
-5. Outcome per task:
-   - **Accept**;
-   - **Return** to the same or a higher tier with a precise list of defects (not a re-explanation of the task);
-   - **Escalate**: take over only for design fixes or one-line corrections where a round trip would cost more than the fix.
-
-Cap at two return rounds per task; after that, re-plan or ask the user.
-
-## 6. Close
-
-Report to the user in the session's usual style: what changed and where, what was verified, what was left out and why, follow-ups noticed but not touched. Mention which tiers ran, one line, no per-task narration.
+Never delegate recursively when CLAUDE_CODEX_WORKER=1 or MANIFOLD_COLLAB_WORKER=1. Delegation does not expand user authorization.

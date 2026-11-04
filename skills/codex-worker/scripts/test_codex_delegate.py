@@ -1,6 +1,7 @@
 """Contract tests use temporary directories and mocks; no model is ever invoked."""
 import argparse
 import contextlib
+import datetime as dt
 import io
 import json
 import os
@@ -134,9 +135,12 @@ class WorkerTests(unittest.TestCase):
 
     def test_catalog_normalizes_real_cache_shape_and_checks_effort(self):
         raw = {"fetched_at": "test", "identity": {"not_exported": True}, "models": [
-            {"slug": MODEL, "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}]}]}
+            {"slug": MODEL, "display_name": "Future account model", "description": "official metadata " + "x" * 1200,
+             "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}]}]}
         catalog = worker.normalize_catalog(raw, "cache")
         self.assertNotIn("identity", catalog)
+        self.assertEqual(catalog["models"][0]["display_name"], "Future account model")
+        self.assertEqual(len(catalog["models"][0]["description"]), 1000)
         worker.verify_model(catalog, MODEL, "medium")
         for model, effort in ((MODEL, "ultra"), ("invented-model", "medium")):
             with self.assertRaises(worker.WorkerError):
@@ -362,6 +366,347 @@ class WorkerTests(unittest.TestCase):
             exit_code = worker.main(["catalog", "--cached"])
         self.assertEqual(exit_code, 0)
         self.assertEqual(json.loads(output.getvalue())["status"], "complete")
+
+    def implement(self, scope=None):
+        task = packet("implement")
+        if scope is not None:
+            task["scope_paths"] = scope
+        worker.write_json(self.packet_path, task)
+
+    def test_snapshot_copies_current_dirty_input_and_patch_never_changes_source(self):
+        source = self.workspace / "example.py"
+        source.write_text("dirty input\n", encoding="utf-8")
+        (self.workspace / ".env").write_text("PASSWORD=not-for-worker", encoding="utf-8")
+        self.implement()
+        def change(*args):
+            cwd = args[2]
+            self.assertNotEqual(cwd, self.workspace)
+            self.assertEqual((cwd / "example.py").read_text(), "dirty input\n")
+            self.assertEqual(sorted(p.name for p in cwd.iterdir()), ["example.py"])
+            self.fake_execute(*args)
+            (cwd / "example.py").write_text("reviewable output\n", encoding="utf-8")
+            return 0
+        with self.preflight(change):
+            saved = worker.run_task(self.args)
+        self.assertEqual(saved["status"], "complete")
+        self.assertEqual(source.read_text(), "dirty input\n")
+        self.assertEqual(saved["workspace"], str(self.workspace))
+        self.assertEqual(saved["execution_workspace"]["strategy"], "scope_snapshot")
+        patch_text = Path(saved["artifacts"]["patch"]).read_text()
+        self.assertIn("-dirty input", patch_text)
+        self.assertIn("+reviewable output", patch_text)
+        self.assertNotIn("PASSWORD", patch_text)
+        self.assertEqual(saved["result"]["changed_files"], ["example.py"])
+        git = worker.shutil.which("git.exe") or worker.shutil.which("git")
+        checked = subprocess.run([git, "apply", "--check", saved["artifacts"]["patch"]], cwd=self.workspace,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
+        self.assertEqual(checked.returncode, 0, checked.stderr.decode("utf-8", "replace"))
+        self.assertEqual(source.read_text(), "dirty input\n")
+
+    def test_actual_unreported_out_of_scope_file_or_empty_directory_blocks_export(self):
+        self.implement()
+        for make_dir in (False, True):
+            def change(*args):
+                self.fake_execute(*args)
+                target = args[2] / "unauthorized"
+                if make_dir:
+                    target.mkdir()
+                else:
+                    target.write_text("unreported", encoding="utf-8")
+                return 0
+            with self.preflight(change):
+                saved = worker.run_task(self.args)
+            self.assertEqual(saved["status"], "blocked")
+            self.assertEqual(saved["failure_kind"], "validation")
+            self.assertIsNone(saved["artifacts"]["patch"])
+            self.assertIsNone(saved["artifacts"]["changes"])
+            self.assertFalse((Path(saved["run_dir"]) / "changes.patch").exists())
+            self.assertFalse((self.workspace / "unauthorized").exists())
+
+    def test_actual_deletions_and_renames_are_delivered_without_source_mutation(self):
+        directory = self.workspace / "src"
+        directory.mkdir()
+        (directory / "old.py").write_text("old dirty contents\n", encoding="utf-8")
+        self.implement(["src"])
+        def rename(*args):
+            self.fake_execute(*args)
+            (args[2] / "src" / "old.py").rename(args[2] / "src" / "new.py")
+            return 0
+        with self.preflight(rename):
+            saved = worker.run_task(self.args)
+        self.assertEqual(saved["status"], "complete")
+        changes = worker.read_json(saved["artifacts"]["changes"])["changes"]
+        self.assertEqual({(entry["path"], entry["change"]) for entry in changes}, {("src/old.py", "deleted"), ("src/new.py", "added")})
+        self.assertTrue((directory / "old.py").exists())
+        self.assertFalse((directory / "new.py").exists())
+
+    def test_rename_outside_scope_cannot_export_even_if_model_omits_it(self):
+        self.implement()
+        def rename(*args):
+            self.fake_execute(*args)
+            (args[2] / "example.py").rename(args[2] / "outside.py")
+            return 0
+        with self.preflight(rename):
+            saved = worker.run_task(self.args)
+        self.assertEqual(saved["status"], "blocked")
+        self.assertIsNone(saved["artifacts"]["patch"])
+        self.assertTrue((self.workspace / "example.py").exists())
+
+    def test_actual_readonly_write_is_blocked_without_trusting_report(self):
+        def change(*args):
+            self.fake_execute(*args)
+            (args[2] / "example.py").unlink()
+            return 0
+        with self.preflight(change):
+            saved = worker.run_task(self.args)
+        self.assertEqual(saved["status"], "blocked")
+        self.assertIsNone(saved["artifacts"]["patch"])
+        self.assertIn("read-only", saved["summary"])
+
+    def test_root_empty_sensitive_and_in_repository_links_cannot_expand_scope(self):
+        for scope in (["."], [], [".env"], [".git/config"], [".aws/credentials"]):
+            with self.assertRaises(worker.WorkerError):
+                worker.validate_packet({**packet(), "scope_paths": scope}, self.workspace)
+        link = self.workspace / "internal-link.py"
+        try:
+            link.symlink_to(self.workspace / "example.py")
+        except OSError:
+            self.skipTest("This account cannot create symbolic links.")
+        with self.assertRaises(worker.WorkerError):
+            worker.normalize_scope(self.workspace, ["internal-link.py"])
+
+    def test_directory_scope_skips_credentials_and_runtime_without_copying(self):
+        directory = self.workspace / "src"
+        directory.mkdir()
+        (directory / "code.py").write_text("safe\n", encoding="utf-8")
+        (directory / ".env").write_text("private\n", encoding="utf-8")
+        (directory / ".git").mkdir()
+        (directory / ".git" / "config").write_text("private", encoding="utf-8")
+        task = {**packet(), "scope_paths": ["src"]}
+        worker.write_json(self.packet_path, task)
+        with self.preflight():
+            saved = worker.run_task(self.args)
+        execution = saved["execution_workspace"]
+        self.assertEqual(saved["status"], "complete")
+        self.assertFalse((Path(execution["path"]) / "src" / ".env").exists())
+        self.assertFalse((Path(execution["path"]) / "src" / ".git").exists())
+        self.assertEqual(set(execution["omitted_paths"]), {"src/.env", "src/.git"})
+
+    def test_nested_symlink_is_not_copied_and_no_model_is_started(self):
+        directory = self.workspace / "src"
+        directory.mkdir()
+        try:
+            (directory / "link.py").symlink_to(self.workspace / "example.py")
+        except OSError:
+            self.skipTest("This account cannot create symbolic links.")
+        worker.write_json(self.packet_path, {**packet(), "scope_paths": ["src"]})
+        with self.preflight(), mock.patch.object(worker, "execute") as execute:
+            saved = worker.run_task(self.args)
+        self.assertEqual(saved["status"], "blocked")
+        execute.assert_not_called()
+
+    def test_failure_categories_are_machine_readable_and_do_not_retry(self):
+        examples = {"timeout": "Task timed out after 5 seconds", "quota": "429 rate limit exceeded",
+                    "auth": "ChatGPT auth not verified", "permission": "Access is denied by permission",
+                    "unsupported_model": "Model 'unlisted' is absent from the official account cache",
+                    "validation": "Actual snapshot changes fall outside authorized scope"}
+        for expected, message in examples.items():
+            with self.subTest(kind=expected):
+                failure = worker.blocked_result(message)
+                self.assertEqual(failure["failure_kind"], expected)
+                self.assertTrue(failure["next_action"])
+                self.assertIsInstance(failure["retryable"], bool)
+        with self.preflight(), mock.patch.object(worker, "execute", side_effect=worker.WorkerError("429 quota exceeded")) as execute:
+            saved = worker.run_task(self.args)
+        self.assertEqual(saved["failure_kind"], "quota")
+        execute.assert_called_once()
+
+    def test_explicit_review_and_attempt_keep_linkage_and_readonly_contract(self):
+        with self.preflight():
+            prior = worker.run_task(self.args)
+        worker.write_json(self.packet_path, {**packet("review"), "review_of": prior["job_id"], "parent_job": prior["job_id"]})
+        with self.preflight():
+            saved = worker.run_task(self.args)
+        self.assertEqual(saved["status"], "complete")
+        self.assertEqual(saved["permission"], "read-only")
+        self.assertEqual(saved["review_of"], prior["job_id"])
+        self.assertEqual(saved["attempt"], 2)
+        self.assertEqual(saved["result"]["author_provider"], "codex")
+        with self.assertRaises(worker.WorkerError):
+            worker.validate_packet({**packet("implement"), "review_of": prior["job_id"]}, self.workspace)
+
+    def test_claude_external_review_reference_does_not_require_codex_job(self):
+        worker.write_json(self.packet_path, {**packet("review"), "author_provider": "claude", "review_of": "a17c028f-claude-agent"})
+        with self.preflight():
+            saved = worker.run_task(self.args)
+        self.assertEqual(saved["status"], "complete")
+        self.assertEqual(saved["author_provider"], "claude")
+        self.assertEqual(saved["execution_provider"], "codex")
+        self.assertFalse(saved["review_reference"]["local_state_verified"])
+        worker.write_json(self.packet_path, {**packet("review"), "author_provider": "claude", "parent_job": "missing-job"})
+        with self.preflight(), mock.patch.object(worker, "execute") as execute:
+            saved = worker.run_task(self.args)
+        self.assertEqual(saved["status"], "blocked")
+        execute.assert_not_called()
+
+    def test_codex_review_reads_prior_candidate_and_patch_without_source_fallback(self):
+        source = self.workspace / "example.py"
+        source.write_text("x = 1\n", encoding="utf-8")
+        self.implement()
+        def implement(*args):
+            self.fake_execute(*args)
+            (args[2] / "example.py").write_text("x = 2\n", encoding="utf-8")
+            return 0
+        with self.preflight(implement):
+            prior = worker.run_task(self.args)
+        self.assertEqual(prior["status"], "complete")
+        self.assertEqual(source.read_text(), "x = 1\n")
+        worker.write_json(self.packet_path, {**packet("review"), "author_provider": "codex", "review_of": prior["job_id"]})
+        def review(*args):
+            self.assertEqual((args[2] / "example.py").read_text(), "x = 2\n")
+            evidence = (args[2] / ".savvy-review-evidence" / "changes.patch").read_text()
+            self.assertIn("-x = 1", evidence)
+            self.assertIn("+x = 2", evidence)
+            self.assertIn(prior["job_id"], args[1])
+            return self.fake_execute(*args)
+        with self.preflight(review):
+            saved = worker.run_task(self.args)
+        self.assertEqual(saved["status"], "complete")
+        self.assertEqual(saved["review_source_job"], prior["job_id"])
+        self.assertEqual(source.read_text(), "x = 1\n")
+        self.assertEqual(Path(saved["artifacts"]["review_source_patch"]).read_bytes(), Path(prior["artifacts"]["patch"]).read_bytes())
+        # A test available only in the original tree is not silently substituted.
+        (self.workspace / "test_example.py").write_text("original tree only", encoding="utf-8")
+        worker.write_json(self.packet_path, {**packet("review"), "author_provider": "codex", "review_of": prior["job_id"], "scope_paths": ["example.py", "test_example.py"]})
+        with self.preflight(), mock.patch.object(worker, "execute") as execute:
+            missing = worker.run_task(self.args)
+        self.assertEqual(missing["status"], "blocked")
+        self.assertIn("Missing review candidate input", missing["summary"])
+        execute.assert_not_called()
+
+    def test_export_rejects_late_outside_write_and_never_writes_patch(self):
+        run = self.root / "snapshot-run"
+        run.mkdir()
+        snapshot = worker.scope_snapshot.prepare(self.workspace, [self.workspace / "example.py"], run, ["example.py"])
+        execution = Path(snapshot["path"])
+        (execution / "example.py").write_text("validated change\n", encoding="utf-8")
+        changes, rejected = worker.scope_snapshot.inspect_changes(snapshot)
+        self.assertFalse(rejected)
+        (execution / "outside.txt").write_text("late child output\n", encoding="utf-8")
+        with self.assertRaises(worker.scope_snapshot.SnapshotError):
+            worker.scope_snapshot.export(snapshot, run, changes)
+        self.assertFalse((run / "changes.patch").exists())
+
+    def test_export_frozen_index_uses_only_validated_literal_paths(self):
+        run = self.root / "snapshot-run"
+        run.mkdir()
+        snapshot = worker.scope_snapshot.prepare(self.workspace, [self.workspace / "example.py"], run, ["example.py"])
+        execution = Path(snapshot["path"])
+        (execution / "example.py").write_text("validated change\n", encoding="utf-8")
+        changes, _ = worker.scope_snapshot.inspect_changes(snapshot)
+        original = worker.scope_snapshot.git_command
+        injected = False
+        def late_write(*args):
+            nonlocal injected
+            output = original(*args)
+            if "add" in args and not injected:
+                injected = True
+                (execution / "outside.txt").write_text("after staging\n", encoding="utf-8")
+            return output
+        with mock.patch.object(worker.scope_snapshot, "git_command", side_effect=late_write), self.assertRaises(worker.scope_snapshot.SnapshotError):
+            worker.scope_snapshot.export(snapshot, run, changes)
+        self.assertFalse((run / "changes.patch").exists())
+        paths = original(execution, Path(snapshot["git_dir"]), "diff", "--cached", "--name-only", snapshot["baseline_commit"]).decode()
+        self.assertEqual(paths.strip(), "example.py")
+
+    def cleanup_args(self, dry_run=False):
+        return argparse.Namespace(workspace=str(self.workspace), state_root=self.args.state_root, days=30, dry_run=dry_run)
+
+    def old_job(self, status="complete"):
+        _, _, saved = worker.initialize_run(self.args)
+        saved.update(status=status, controller_pid=None, child_pid=None,
+                     finished_at=(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=40)).isoformat())
+        worker.write_json(saved["artifacts"]["state"], saved)
+        return saved
+
+    def test_cleanup_deletes_only_expired_terminal_jobs_and_dry_run_is_readonly(self):
+        old = self.old_job()
+        active = self.old_job("running")
+        unknown = self.old_job("new_status")
+        with mock.patch.object(worker, "discover_cli") as cli:
+            dry = worker.cleanup(self.cleanup_args(True))
+            self.assertEqual(dry["would_delete"], [old["run_dir"]])
+            self.assertTrue(Path(old["run_dir"]).exists())
+            actual = worker.cleanup(self.cleanup_args())
+            cli.assert_not_called()
+        self.assertEqual(actual["deleted"], [old["run_dir"]])
+        self.assertTrue(Path(active["run_dir"]).exists())
+        self.assertTrue(Path(unknown["run_dir"]).exists())
+
+    def test_cleanup_protects_live_terminal_linked_worktree_external_paths_and_latest(self):
+        live, linked, external, latest = (self.old_job() for _ in range(4))
+        live["controller_pid"] = os.getpid()
+        worker.write_json(live["artifacts"]["state"], live)
+        (Path(linked["run_dir"]) / ".git").write_text("gitdir: outside", encoding="utf-8")
+        external["execution_workspace"] = {"path": str(self.workspace), "strategy": "scope_snapshot"}
+        worker.write_json(external["artifacts"]["state"], external)
+        worker.write_json(Path(latest["run_dir"]).parent / "latest.json", {"job_id": latest["job_id"]})
+        result = worker.cleanup(self.cleanup_args())
+        self.assertEqual(result["deleted"], [])
+        self.assertEqual({entry["reason"] for entry in result["skipped"]},
+                         {"recorded_process_alive", "linked_worktree", "linked_or_external_workspace", "protected_latest_reference"})
+
+    def test_cleanup_rejects_symlinked_hash_directory_and_state_root_ancestors(self):
+        saved = self.old_job()
+        real_root = Path(self.args.state_root)
+        linked_root = self.root / "linked-runs"
+        try:
+            linked_root.symlink_to(real_root, target_is_directory=True)
+        except OSError:
+            self.skipTest("This account cannot create symbolic links.")
+        args = self.cleanup_args()
+        args.state_root = str(linked_root)
+        with self.assertRaises(worker.WorkerError):
+            worker.cleanup(args)
+        digest = Path(saved["run_dir"]).parent.name
+        other_root = self.root / "other-runs"
+        other_root.mkdir()
+        (other_root / digest).symlink_to(Path(saved["run_dir"]).parent, target_is_directory=True)
+        args.state_root = str(other_root)
+        with self.assertRaises(worker.WorkerError):
+            worker.cleanup(args)
+        self.assertTrue(Path(saved["run_dir"]).exists())
+
+    def test_cleanup_skips_malformed_launch_and_timestamp_and_continues(self):
+        malformed_launch, malformed_finished, valid = (self.old_job() for _ in range(3))
+        worker.write_json(Path(malformed_launch["run_dir"]) / "launch.json", [])
+        malformed_finished["finished_at"] = None
+        worker.write_json(malformed_finished["artifacts"]["state"], malformed_finished)
+        result = worker.cleanup(self.cleanup_args())
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["deleted"], [valid["run_dir"]])
+        self.assertEqual(len(result["skipped"]), 2)
+        self.assertTrue(Path(malformed_launch["run_dir"]).exists())
+        self.assertTrue(Path(malformed_finished["run_dir"]).exists())
+
+    def test_doctor_json_has_readiness_checks_and_never_runs_a_model(self):
+        with self.preflight(), mock.patch.object(worker, "capture", return_value=subprocess.CompletedProcess([], 0, "git version 2.0", "")), \
+             mock.patch.object(worker, "execute") as execute:
+            info = worker.doctor()
+            execute.assert_not_called()
+        self.assertTrue(info["ready"])
+        self.assertEqual(set(info["checks"]), {"official_cli", "version", "features", "authentication", "catalog", "git"})
+        self.assertEqual(worker.parser().parse_args(["doctor", "--json"]).command, "doctor")
+        with self.preflight(), mock.patch.object(worker.shutil, "which", return_value=None):
+            info = worker.doctor()
+        self.assertFalse(info["ready"])
+        self.assertFalse(info["checks"]["git"]["ok"])
+
+    def test_additional_credential_environment_is_not_forwarded(self):
+        env = worker.child_environment({"GH_TOKEN": "secret", "AWS_ACCESS_KEY_ID": "secret", "SSH_AUTH_SOCK": "socket",
+                                        "SERVICE_PASSWORD": "secret", "PATH": "keep"}, {})
+        self.assertEqual(env, {"PATH": "keep", "CLAUDE_CODEX_WORKER": "1"})
 
 
 if __name__ == "__main__":

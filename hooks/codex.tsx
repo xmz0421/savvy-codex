@@ -1,11 +1,14 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderElement, RenderSurface } from 'claude-code'
 import type { CodexJob, CodexPanel, CodexResult, CodexStatus, Effort } from '../types'
+import { workflowAllowed, workflowRefusal } from './workflow'
 
 // These are external official Codex CLI workers. They never impersonate a Claude
 // AgentRun, and nothing in this module calls a Claude/model completion API.
 export const CODEX_DELEGATE = 'mcp__savvy-codex__codex_delegate'
 export const CODEX_STATUS = 'mcp__savvy-codex__codex_status'
+export const CODEX_CATALOG = 'mcp__savvy-codex__codex_catalog'
+export const CODEX_CLEANUP = 'mcp__savvy-codex__codex_cleanup'
 export const AGENTS_PANE = 'savvy-agents'
 export const POLL_MS = 1500
 const MAX_JOBS = 100
@@ -13,7 +16,6 @@ const MAX_JSON = 256 * 1024
 const MAX_PACKET = 64 * 1024
 const MAX_PREVIEW = 256 * 1024
 const MAX_PREVIEW_CHARS = 24_000
-const EFFORTS: Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
 const ACTIVE: CodexStatus[] = ['queued', 'preparing', 'running', 'unknown']
 const TERMINAL: CodexStatus[] = ['complete', 'blocked', 'failed', 'cancelled', 'timeout']
 
@@ -27,7 +29,7 @@ const panelAtom = atom({ plugin: 'savvy-codex', key: 'codexPanel' } as const, {
 })
 
 type Dict = Record<string, unknown>
-type WorkerOptions = { pythonPath?: unknown; pluginRoot?: unknown; helperPath?: unknown }
+type WorkerOptions = { pythonPath?: unknown; pluginRoot?: unknown; helperPath?: unknown; retentionDays?: unknown }
 let workerOptions: WorkerOptions = {}
 type DelegateInput = {
   workspace?: unknown
@@ -79,6 +81,16 @@ export function within(root: string, path: string): boolean {
   return candidate === base || candidate.startsWith(`${base}/`)
 }
 
+export function normalizeScopes(workspace: string, value: unknown): string[] {
+  const root = absolutePath(workspace).replace(/\/$/, '')
+  return strings(value).flatMap(scope => {
+    try {
+      const path = absolutePath(/^(?:[A-Za-z]:[\\/]|\/)/.test(scope) ? scope : `${root}/${scope}`)
+      return within(root, path) && !samePath(root, path) && !sensitivePath(path) ? [path.slice(root.length + 1)] : []
+    } catch { return [] }
+  }).filter((scope, index, all) => all.indexOf(scope) === index)
+}
+
 export function sensitivePath(path: string): boolean {
   return path.replace(/\\/g, '/').split('/').some(part =>
     /^(?:\.env(?:\..*)?|\.ssh|\.aws|\.azure|\.gnupg|\.kube|\.git|\.npmrc|\.netrc|\.pypirc|auth\.json|credentials(?:\..*)?|secrets?(?:\..*)?|tokens?(?:\..*)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?)$/i.test(part) ||
@@ -94,7 +106,7 @@ function ancestors(path: string): string[] {
   return out
 }
 
-async function readSafe($: EngineInterface, path: string, root: string, maxBytes: number): Promise<string> {
+export async function readSafe($: EngineInterface, path: string, root: string, maxBytes = MAX_PREVIEW): Promise<string> {
   if (!within(root, path) || sensitivePath(path)) throw new Error('该路径不在允许查看的任务文件中，或属于凭证文件。')
   let size = 0
   for (const [index, part] of ancestors(path).entries()) {
@@ -182,12 +194,39 @@ export function mergeState(previous: CodexJob, raw: Dict): CodexJob {
   const tool = typeof raw.last_tool === 'string' ? raw.last_tool : dict(raw.last_tool).name
   const usage = dict(raw.usage)
   const tokenCount = typeof raw.tokens === 'number' ? raw.tokens : usage.total_tokens
+  const execution = dict(raw.execution_workspace)
+  const packet = dict(raw.task_packet)
+  const executionPath = execution.path ? absolutePath(execution.path) : previous.executionWorkspace
+  if (executionPath && !samePath(executionPath, `${previous.runDir}/workspace`)) throw new Error('执行快照路径不在当前任务的 workspace 目录。')
+  const stateScopes = Array.isArray(execution.scope_entries) ? execution.scope_entries.map(entry => dict(entry).path) : execution.scope_paths ?? raw.scope_paths
+  const artifactPath = (value: unknown, filename: string): string => {
+    if (!value) return ''
+    const candidate = absolutePath(value)
+    if (!samePath(candidate, `${previous.runDir}/${filename}`)) throw new Error('任务产物路径超出约定文件。')
+    return candidate
+  }
   return {
     ...previous,
     model: cleanText(raw.model || raw.selected_model || previous.model, 160),
     effort: cleanText(raw.effort || raw.selected_effort || previous.effort, 40),
-    goal: cleanText(raw.goal || raw.task || previous.goal, 2000),
-    reason: cleanText(raw.reason || previous.reason, 2000),
+    goal: cleanText(raw.goal || raw.task || previous.goal, MAX_PACKET),
+    reason: cleanText(raw.reason || packet.reason || previous.reason, MAX_PACKET),
+    taskPrompt: previous.taskPrompt || (Object.keys(packet).length ? cleanText(JSON.stringify(Object.fromEntries(['goal', 'reason', 'context', 'acceptance', 'tests', 'scope_paths', 'kind'].filter(key => packet[key] !== undefined).map(key => [key, packet[key]])), null, 2), MAX_PACKET) : undefined),
+    executionWorkspace: executionPath,
+    scopePaths: stateScopes === undefined ? previous.scopePaths ?? [] : normalizeScopes(previous.workspace, stateScopes),
+    patchPath: artifactPath(artifacts.patch_path ?? artifacts.patch, 'changes.patch'),
+    changesPath: artifactPath(artifacts.changes_path ?? artifacts.changes, 'changes.json'),
+    reviewSourcePatchPath: artifactPath(artifacts.review_source_patch, 'review-source.patch'),
+    reviewSourceJob: cleanText(raw.review_source_job || previous.reviewSourceJob, 160),
+    isolationNotice: cleanText(execution.notice || dict(raw.isolation).notice || previous.isolationNotice, 2000),
+    kind: cleanText(raw.kind || previous.kind, 80),
+    reviewOf: cleanText(raw.review_of || previous.reviewOf, 160),
+    parentJob: cleanText(raw.parent_job || previous.parentJob, 160),
+    authorProvider: cleanText(raw.author_provider || previous.authorProvider, 80),
+    attempt: typeof raw.attempt === 'number' && Number.isInteger(raw.attempt) ? raw.attempt : previous.attempt,
+    failureKind: cleanText(raw.failure_kind || previous.failureKind, 300),
+    nextAction: cleanText(raw.next_action || previous.nextAction, 2000),
+    retryable: typeof raw.retryable === 'boolean' ? raw.retryable : previous.retryable,
     status: actualStatus ? normalizeStatus(actualStatus) : previous.status,
     rawStatus: actualStatus || previous.rawStatus,
     startedAt: cleanText(raw.started_at || previous.startedAt, 100),
@@ -208,7 +247,7 @@ export function mergeState(previous: CodexJob, raw: Dict): CodexJob {
 
 export async function codexJobs($: EngineInterface): Promise<CodexJob[]> { return read($, jobsAtom) }
 export async function codexPreviewIsOpen($: EngineInterface): Promise<boolean> {
-  return Boolean((await read($, panelAtom)).previewPath)
+  return Boolean((await read($, panelAtom)).selectedId)
 }
 export async function beginCodexFlow($: EngineInterface): Promise<void> {
   const active = await update($, jobsAtom, list => list.filter(isActive))
@@ -228,6 +267,7 @@ async function saveJob($: EngineInterface, job: CodexJob): Promise<void> {
 }
 
 async function refreshJob($: EngineInterface, job: CodexJob): Promise<CodexJob> {
+  if (!job.statePath) return job // Failed launch entries have no executor directory.
   let next: CodexJob
   try {
     const raw = await readJson($, job.statePath, job.runDir)
@@ -270,6 +310,9 @@ function toolSummary(job: CodexJob, extra: Dict = {}): Dict {
     result_path: job.resultPath,
     summary: job.summary,
     changed_files: job.changedFiles,
+    kind: job.kind || '', review_of: job.reviewOf || '', parent_job: job.parentJob || '', author_provider: job.authorProvider || '',
+    attempt: job.attempt, failure_kind: job.failureKind || '', next_action: job.nextAction || '', retryable: job.retryable,
+    execution_workspace: job.executionWorkspace || '', scope_paths: job.scopePaths || [],
     ...(job.result ? { result: job.result } : {}),
     ...(job.readError ? { state_note: job.readError } : {}),
     ...extra,
@@ -324,6 +367,7 @@ async function diagnoseJob($: EngineInterface, job: CodexJob): Promise<Dict> {
   // Only an explicit status request performs the helper's PID/liveness checks.
   // The UI timer itself reads files and never spawns repeated processes.
   try {
+    if (!job.runDir) return toolSummary(job)
     const result = await $.process.run([...await workerCommand($), 'status', '--run-dir', job.runDir], { cwd: job.workspace, timeoutMs: 15_000 })
     const raw = parseProcess(result)
     if (!string(raw.job_id) && !string(raw.id)) throw new Error(cleanText(raw.summary, 600) || '执行器没有返回此任务的状态。')
@@ -350,7 +394,7 @@ async function delegate($: EngineInterface, input: DelegateInput): Promise<Dict>
   const approval = input.approval === undefined ? 'never' : string(input.approval)
   const timeout = timeoutOf(input.timeout)
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(model)) throw new Error('必须明确提供完整的 Codex model id。')
-  if (!EFFORTS.includes(effort)) throw new Error('必须明确选择 effort：low、medium、high、xhigh 或 max。')
+  if (!/^[a-z][a-z0-9_-]{0,39}$/.test(effort)) throw new Error('必须明确提供合法 effort；可用值由本机 Codex catalog 核验。')
   if (!['read-only', 'workspace-write'].includes(permission) || !['never', 'auto-review'].includes(approval)) throw new Error('permission 或 approval 无效。')
   if ((permission === 'read-only' && approval !== 'never') || (permission === 'workspace-write' && approval !== 'auto-review')) throw new Error('只读任务使用 never；可写任务使用 auto-review。')
   if (input.background !== undefined && typeof input.background !== 'boolean') throw new Error('background 必须是布尔值。')
@@ -362,15 +406,33 @@ async function delegate($: EngineInterface, input: DelegateInput): Promise<Dict>
   const reason = string(packet.reason)
   const goal = string(packet.goal)
   if (!reason || !goal) throw new Error('任务包必须含非空 goal 与 reason，说明任务和模型/effort 的选择依据。')
-  const processResult = await $.process.run([
-    ...await workerCommand($), 'start', '--workspace', workspace, '--packet', packetPath,
-    '--model', model, '--effort', effort, '--permission', permission, '--approval', approval, '--timeout', String(timeout),
-  ], { cwd: workspace, timeoutMs: 30_000 })
-  const started = parseProcess(processResult)
+  const failedLaunch = async (raw: Dict): Promise<Dict> => {
+    const at = new Date(await $.clock.now()).toISOString()
+    const failure: CodexJob = {
+      id: `launch-${Date.parse(at)}-${(await codexJobs($)).length}`, provider: 'external-codex', workspace,
+      runDir: '', statePath: '', reportPath: '', resultPath: '', model, effort,
+      goal, reason, taskPrompt: cleanText(JSON.stringify(packet, null, 2), MAX_PACKET),
+      status: 'blocked', rawStatus: string(raw.status) || 'blocked', startedAt: at, finishedAt: at, updatedAt: at,
+      summary: cleanText(raw.summary, 12_000) || '执行器未能启动 worker。', lastTool: '', lastMessage: '', changedFiles: [], readError: '', authenticationVerified: false,
+      kind: cleanText(packet.kind, 80) || 'launch', reviewOf: cleanText(packet.review_of, 160), parentJob: cleanText(packet.parent_job, 160),
+      authorProvider: ['claude', 'codex'].includes(string(packet.author_provider)) ? string(packet.author_provider) : packet.kind === 'review' ? '' : 'codex',
+      attempt: typeof packet.attempt === 'number' && Number.isInteger(packet.attempt) && packet.attempt > 0 ? packet.attempt : 1,
+      failureKind: cleanText(raw.failure_kind, 300) || 'launch_failed', nextAction: cleanText(raw.next_action, 2000), retryable: raw.retryable === true,
+    }
+    await saveJob($, failure)
+    await openAgents($)
+    return toolSummary(failure)
+  }
+  let started: Dict
+  try {
+    started = parseProcess(await $.process.run([
+      ...await workerCommand($), 'start', '--workspace', workspace, '--packet', packetPath,
+      '--model', model, '--effort', effort, '--permission', permission, '--approval', approval, '--timeout', String(timeout),
+    ], { cwd: workspace, timeoutMs: 30_000 }))
+  } catch (error) { return failedLaunch({ summary: cleanText(error instanceof Error ? error.message : String(error), 2000) }) }
   const id = string(started.job_id) || string(started.id)
   if (!id || !/^[A-Za-z0-9_-]{1,120}$/.test(id)) {
-    if (started.status) return { provider: 'external Codex worker', ...started }
-    throw new Error('执行器没有返回有效 job_id。')
+    return failedLaunch({ ...started, summary: started.summary || '执行器没有返回有效 job_id。' })
   }
   const runDir = absolutePath(started.run_dir)
   if (!within(await runRoot($), runDir) || runDir.split('/').pop() !== id) throw new Error('执行器返回的任务目录不在 codex-worker-runs 内。')
@@ -379,7 +441,7 @@ async function delegate($: EngineInterface, input: DelegateInput): Promise<Dict>
   const seed: CodexJob = {
     id, provider: 'external-codex', workspace, runDir, statePath,
     reportPath: `${runDir}/report.md`, resultPath: `${runDir}/final.json`,
-    goal: cleanText(goal, 2000), reason: cleanText(reason, 2000), model, effort,
+    goal: cleanText(goal, MAX_PACKET), reason: cleanText(reason, MAX_PACKET), taskPrompt: cleanText(JSON.stringify(packet, null, 2), MAX_PACKET), scopePaths: normalizeScopes(workspace, packet.scope_paths), model, effort,
     status: 'queued', rawStatus: 'queued',
     startedAt: new Date(await $.clock.now()).toISOString(), finishedAt: '', updatedAt: '',
     summary: '', lastTool: '', lastMessage: '', changedFiles: [], readError: '', authenticationVerified: false,
@@ -406,7 +468,7 @@ export async function startCodex($: EngineInterface): Promise<void> {
         workspace: { type: 'string', description: '已授权工作区的本机绝对路径。' },
         packet_file: { type: 'string', description: '已写好的 JSON 任务包绝对路径；含 goal、reason 等 runner 要求字段。' },
         model: { type: 'string', description: '明确指定的完整 Codex model id。' },
-        effort: { type: 'string', enum: EFFORTS },
+        effort: { type: 'string', description: '从 codex_catalog 选择当前模型支持的 effort；执行器按真实 catalog 核验。' },
         permission: { type: 'string', enum: ['read-only', 'workspace-write'], default: 'read-only' },
         approval: { type: 'string', enum: ['never', 'auto-review'], default: 'never' },
         timeout: { type: 'integer', minimum: 1, maximum: 3600, default: 900 },
@@ -415,6 +477,12 @@ export async function startCodex($: EngineInterface): Promise<void> {
       required: ['workspace', 'packet_file', 'model', 'effort'],
     },
   })
+  await $.tool.register({ name: 'codex_catalog', isDeferred: false,
+    description: 'Read the official local Codex model catalog. refresh=true updates the CLI cache without a model completion; otherwise use the cache. Report availability honestly.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: { refresh: { type: 'boolean', default: false } } } })
+  await $.tool.register({ name: 'codex_cleanup', isDeferred: false,
+    description: 'Clean expired terminal worker artifacts for an explicitly supplied workspace. Default is a dry run; never removes active tasks or auth/config files. This does not call a model.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: { workspace: { type: 'string' }, days: { type: 'integer', minimum: 1, maximum: 3650, default: 30 }, dry_run: { type: 'boolean', default: true } }, required: ['workspace'] } })
   await $.tool.register({
     name: 'codex_status', isDeferred: false,
     description: '读取本会话已跟踪 Codex worker 的真实状态与结果，不重交任务。wait=true 在本次工具调用内等到终态或超时；无需频繁向模型发状态查询。只能查询已跟踪 job_id/run_dir。',
@@ -446,8 +514,27 @@ export const registerCodex: Register = (on, options) => {
   on('tool.call', { tool: CODEX_DELEGATE }, async ($, e) => {
     const refusal = await recursionBlocked($, e.agentId)
     if (refusal) return { result: { provider: 'external Codex worker', status: 'blocked', summary: refusal } }
+    if (!await workflowAllowed($)) return { result: { provider: 'external Codex worker', status: 'blocked', summary: await workflowRefusal($) } }
     try { return { result: await delegate($, e as unknown as DelegateInput) } }
     catch (error) { return { result: { provider: 'external Codex worker', status: 'blocked', summary: cleanText(error instanceof Error ? error.message : String(error), 1200) } } }
+  })
+  on('tool.call', { tool: CODEX_CATALOG }, async ($, event) => {
+    if (event.agentId) return { result: { status: 'blocked', summary: 'Only the main session may inspect the catalog.' } }
+    try {
+      const refresh = (event as unknown as { refresh?: unknown }).refresh === true
+      return { result: parseProcess(await $.process.run([...await workerCommand($), 'catalog', refresh ? '--refresh' : '--cached'], { timeoutMs: 30_000 })) }
+    } catch (error) { return { result: { status: 'unavailable', summary: cleanText(String(error), 1200) } } }
+  })
+  on('tool.call', { tool: CODEX_CLEANUP }, async ($, event) => {
+    if (event.agentId) return { result: { status: 'blocked', summary: 'Only the main session may clean worker files.' } }
+    try {
+      const input = event as unknown as { workspace: unknown; days?: unknown; dry_run?: unknown }
+      const workspace = absolutePath(input.workspace)
+      const configured = Number(workerOptions.retentionDays)
+      const days = input.days ?? (Number.isInteger(configured) && configured >= 1 && configured <= 3650 ? configured : 30)
+      if (!Number.isInteger(days) || Number(days) < 1 || Number(days) > 3650 || (input.dry_run !== undefined && typeof input.dry_run !== 'boolean')) throw new Error('Invalid retention arguments.')
+      return { result: parseProcess(await $.process.run([...await workerCommand($), 'cleanup', '--workspace', workspace, '--days', String(days), ...(input.dry_run === false ? [] : ['--dry-run'])], { cwd: workspace, timeoutMs: 30_000 })) }
+    } catch (error) { return { result: { status: 'blocked', summary: cleanText(String(error), 1200) } } }
   })
   on('tool.call', { tool: CODEX_STATUS }, async ($, e) => {
     try {
@@ -478,10 +565,22 @@ export function previewFiles(job: CodexJob): { path: string; label: string; root
       if (within(job.runDir, path) && samePath(path, expected) && !sensitivePath(path)) files.push({ path, label, root: job.runDir })
     } catch { /* A malformed artifact grants no access. */ }
   }
+  for (const [label, candidate, name] of [['补丁', job.patchPath, 'changes.patch'], ['变更清单', job.changesPath, 'changes.json'], ['复核证据补丁', job.reviewSourcePatchPath, 'review-source.patch']]) {
+    if (!candidate) continue
+    try { const path = absolutePath(candidate); if (samePath(path, `${job.runDir}/${name}`)) files.push({ path, label, root: job.runDir }) } catch { /* Invalid metadata grants no access. */ }
+  }
+  // New writable runs are isolated. Never accidentally preview the source file
+  // as though it were the worker's modified snapshot.
+  const executionRoot = job.executionWorkspace || job.workspace
+  if (job.executionWorkspace && !samePath(executionRoot, `${job.runDir}/workspace`)) return files
   for (const candidate of job.changedFiles) {
     try {
-      const path = absolutePath(/^(?:[A-Za-z]:[\\/]|\/)/.test(candidate) ? candidate : `${job.workspace}/${candidate}`)
-      if (within(job.workspace, path) && !sensitivePath(path) && !files.some(file => samePath(file.path, path))) files.push({ path, label: candidate, root: job.workspace })
+      const path = absolutePath(/^(?:[A-Za-z]:[\\/]|\/)/.test(candidate) ? candidate : `${executionRoot}/${candidate}`)
+      const inScope = !job.executionWorkspace || (job.scopePaths ?? []).some(scope => {
+        const scopePath = absolutePath(`${executionRoot}/${scope}`)
+        return within(executionRoot, scopePath) && within(scopePath, path)
+      })
+      if (inScope && within(executionRoot, path) && !sensitivePath(path) && !files.some(file => samePath(file.path, path))) files.push({ path, label: candidate, root: executionRoot })
     } catch { /* Reject traversal, URL, ADS and credential paths. */ }
   }
   return files.slice(0, 202)
@@ -513,6 +612,11 @@ const elapsed = (job: CodexJob, now: number): string => {
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
 }
 
+export const codexRobotSvg = (status: CodexStatus): string => {
+  const eye = status === 'complete' ? '<path d="M17 21l3-2 3 2m8 0 3-2 3 2" fill="none" stroke="#213731" stroke-width="2" stroke-linecap="round"/>' : '<rect x="18" y="18" width="4" height="6" rx="2" fill="#213731"/><rect x="32" y="18" width="4" height="6" rx="2" fill="#213731"/>'
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="54" height="54" viewBox="0 0 54 54"><path d="M27 6v6" stroke="#73b8a5" stroke-width="3"/><circle cx="27" cy="5" r="3" fill="#97d7be"/><rect x="10" y="12" width="34" height="25" rx="8" fill="#bce6d5" stroke="#68a58f" stroke-width="2"/><rect x="6" y="21" width="5" height="10" rx="2" fill="#80bba4"/><rect x="43" y="21" width="5" height="10" rx="2" fill="#80bba4"/>${eye}<path d="M23 29q4 4 8 0" stroke="#213731" stroke-width="2" fill="none" stroke-linecap="round"/><circle cx="15" cy="27" r="2" fill="#e7b3aa"/><circle cx="39" cy="27" r="2" fill="#e7b3aa"/><rect x="17" y="39" width="20" height="9" rx="4" fill="#80bba4"/><path d="M20 47v3m14-3v3" stroke="#568d79" stroke-width="3" stroke-linecap="round"/></svg>`
+}
+
 export async function renderCodex($: EngineInterface, event: Parameters<EngineInterface['ui']['resolve']>[0]): Promise<RenderElement | null> {
   const list = await codexJobs($)
   if (!list.length) return null
@@ -530,8 +634,9 @@ export async function renderCodex($: EngineInterface, event: Parameters<EngineIn
     return (
       <Box key="codex-preview" flexDirection="column" marginTop={1} gap={1}>
         <Box flexDirection="row" gap={1}>
-          <Button key="codex-back" label="返回 Codex 任务" onPress={() => update($, panelAtom, value => ({ ...value, previewPath: '', previewText: '', previewNote: '' }))} />
+          <Button key="codex-back" label="返回任务详情" onPress={() => update($, panelAtom, value => ({ ...value, previewPath: '', previewText: '', previewNote: '' }))} />
           <Button key="codex-copy-preview" label="复制路径" onPress={() => copyPath(panel.previewPath)} />
+          <Button key="codex-copy-text" label="复制内容" onPress={() => copyPath(panel.previewText)} />
         </Box>
         <Text bold>Codex 文件预览</Text>
         <Text>{panel.previewPath}</Text>
@@ -540,6 +645,37 @@ export async function renderCodex($: EngineInterface, event: Parameters<EngineIn
       </Box>
     )
   }
+  const detail = current ? (
+    <Box key="codex-detail" flexDirection="column" gap={1}>
+      <Button key="codex-list-back" label="返回全部任务" onPress={() => update($, panelAtom, value => ({ ...value, selectedId: '' }))} />
+      <Text bold>Codex · {STATUS_LABEL[current.status]} · {current.id}</Text>
+      <Text>{current.model} · effort {current.effort} · {elapsed(current, now)}{current.tokens !== undefined ? ` · ${current.tokens.toLocaleString()} tokens` : ''}</Text>
+      <Text>选择依据：{current.reason || '未知：任务未提供选择依据。'}</Text>
+      <Text>kind: {current.kind || '未知'} · review_of: {current.reviewOf || '无'} · author_provider: {current.authorProvider || '未知'} · attempt: {current.attempt ?? '未知'}</Text>
+      {current.parentJob && <Text>parent_job: {current.parentJob}</Text>}
+      {current.reviewSourceJob && <Text>复核候选任务：{current.reviewSourceJob}</Text>}
+      {current.failureKind && <Text>failure_kind: {current.failureKind}</Text>}
+      {current.nextAction && <Text>next_action: {current.nextAction}</Text>}
+      <Text>{current.authenticationVerified ? 'ChatGPT 登录已核实' : '等待执行器核实 ChatGPT 登录'}</Text>
+      <Text bold>任务全文</Text>
+      <Code source={current.taskPrompt || current.goal} path="task.txt" wrap="wrap" />
+      <Button key="codex-copy-task" label="复制任务" plain onPress={() => copyPath(current.taskPrompt || current.goal)} />
+      <Text>最近工具：{current.lastTool || '未知：执行器未提供工具活动。'}</Text>
+      {current.lastMessage && <Text>活动：{current.lastMessage}</Text>}
+      {current.summary && <Text>{current.summary}</Text>}
+      {current.readError && <Text>{current.readError}</Text>}
+      {current.isolationNotice && <Text>{current.isolationNotice}</Text>}
+      {current.executionWorkspace && <Text>执行目录：{current.executionWorkspace}</Text>}
+      {current.result?.limitations.map((value, index) => <Text key={`limitation-${index}`}>限制：{value}</Text>)}
+      {previewFiles(current).map((file, index) => (
+        <Box key={`file-${current.id}-${index}`} flexDirection="row" gap={1}>
+          <Button key={`codex-file-${current.id}-${index}`} label={`查看 ${file.label}`} plain onPress={() => preview($, current.id, file.path)} />
+          <Button key={`codex-copy-${current.id}-${index}`} label="复制路径" plain onPress={() => copyPath(file.path)} />
+        </Box>
+      ))}
+    </Box>
+  ) : null
+  if (detail) return detail
   return (
     <Box key="codex-jobs" flexDirection="column" marginTop={1} gap={1}>
       <Box flexDirection="row" gap={1}>
@@ -549,25 +685,19 @@ export async function renderCodex($: EngineInterface, event: Parameters<EngineIn
       <Text dimColor>官方 Codex CLI · 显示实际状态与输出；订阅用量由 Codex 管理。</Text>
       {[...list].reverse().map(job => (
         <Box key={`codex-${job.id}`} flexDirection="column" marginBottom={1}>
-          <Text bold>{job.goal}</Text>
+          <Box flexDirection="row" gap={1}>
+            {event.surface === 'desktop' && 'Svg' in ui && <ui.Svg source={codexRobotSvg(job.status)} alt="Codex robot" width={54} height={54} />}
+            <Button key={`codex-row-${job.id}`} label={`${job.goal.slice(0, 160)} ›`} plain onPress={() => update($, panelAtom, value => ({ ...value, selectedId: job.id }))} />
+          </Box>
           <Text>{job.model} · effort {job.effort}</Text>
           <Text dimColor>{job.authenticationVerified ? 'ChatGPT 登录已核实' : '等待执行器核实 ChatGPT 登录'}</Text>
           <Text color={job.status === 'complete' ? 'green' : TERMINAL.includes(job.status) ? 'red' : undefined}>
             {STATUS_LABEL[job.status]}{job.status === 'unknown' ? `（${job.rawStatus || '未返回'}）` : ''} · {elapsed(job, now)}{job.tokens !== undefined ? ` · ${job.tokens.toLocaleString()} tokens` : ''}
           </Text>
-          <Text dimColor>选择依据：{job.reason}</Text>
           {job.lastTool && <Text>最近工具：{job.lastTool}</Text>}
           {job.lastMessage && <Text>输出摘要：{job.lastMessage}</Text>}
           {job.summary && <Text>{job.summary}</Text>}
           {job.readError && <Text>{job.readError}</Text>}
-          {job.result?.limitations.map((value, index) => <Text key={`limitation-${index}`}>限制：{value}</Text>)}
-          <Text dimColor>任务：{job.id}</Text>
-          {previewFiles(job).map((file, index) => (
-            <Box key={`file-${job.id}-${index}`} flexDirection="row" gap={1}>
-              <Button key={`codex-file-${job.id}-${index}`} label={`查看 ${file.label}`} plain onPress={() => preview($, job.id, file.path)} />
-              <Button key={`codex-copy-${job.id}-${index}`} label="复制路径" plain onPress={() => copyPath(file.path)} />
-            </Box>
-          ))}
         </Box>
       ))}
     </Box>

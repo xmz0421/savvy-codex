@@ -1,6 +1,6 @@
 {
   "name": "savvy-codex",
-  "version": "1.3.0-codex.2",
+  "version": "1.4.0-codex.1",
   "description": "Savvy orchestration with Claude and subscription-authenticated Codex workers in the same native Agents panel.",
   "author": {
     "name": "xmz0421 (based on johnnyvizz/claude-kit)",
@@ -11,6 +11,26 @@
   "license": "MIT",
   "types": "./types/index.d.ts",
   "userConfig": {
+    "workflowMode": {
+      "type": "string",
+      "title": "协作模式 / Workflow mode",
+      "description": "默认手动：点开始或 /savvy-start 后才派工。off 禁止新协作派工；auto 允许按任务主动派工。",
+      "default": "manual",
+      "options": ["off", "manual", "auto"]
+    },
+    "priceEstimates": {
+      "type": "string",
+      "title": "Claude API-equivalent estimates",
+      "description": "默认关闭。上游静态价格表未核验，不代表订阅账单。",
+      "default": "off",
+      "options": ["off", "on"]
+    },
+    "retentionDays": {
+      "type": "string",
+      "title": "Run history retention days",
+      "description": "清理命令保留的天数，默认30；仅清理已结束记录，不创建后台计划。",
+      "default": "30"
+    },
     "pythonPath": {
       "type": "string",
       "title": "Python executable",

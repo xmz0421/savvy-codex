@@ -41,13 +41,32 @@ export type AgentRun = {
   stepDone?: number
   stepTotal?: number
   stepNote?: string
+  taskPrompt?: string
+  selectionReason?: string
+  workspace?: string
+  changedFiles?: string[]
+  activities?: { tool: string; status: string; at: number; summary?: string }[]
+  answer?: string
+  kind?: string
+  reviewOf?: string
+  authorProvider?: string
+  attempt?: number
+  failureKind?: string
+  nextAction?: string
 }
 
 export type Panel = {
   isCompact: boolean
   isDoneCollapsed: boolean
   autoOpenedFor: string
+  selectedId?: string
+  previewPath?: string
+  previewText?: string
+  previewNote?: string
 }
+
+export type WorkflowMode = 'off' | 'manual' | 'auto'
+export type WorkflowState = { mode: WorkflowMode; active: boolean; source: string; configuredMode?: WorkflowMode }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -58,11 +77,13 @@ declare module 'claude-code' {
       now: number
       codexJobs: CodexJob[]
       codexPanel: CodexPanel
+      workflow: WorkflowState
     }
   }
 }
 
-export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+/** Valid values are supplied by the user's local Codex catalog. */
+export type Effort = string
 export type CodexStatus = 'queued' | 'preparing' | 'running' | 'complete' | 'blocked' | 'failed' | 'cancelled' | 'timeout' | 'unknown'
 
 export type CodexResult = {
@@ -99,6 +120,22 @@ export type CodexJob = {
   authenticationVerified: boolean
   tokens?: number
   result?: CodexResult
+  taskPrompt?: string
+  executionWorkspace?: string
+  scopePaths?: string[]
+  patchPath?: string
+  changesPath?: string
+  reviewSourcePatchPath?: string
+  reviewSourceJob?: string
+  isolationNotice?: string
+  kind?: string
+  reviewOf?: string
+  parentJob?: string
+  authorProvider?: string
+  attempt?: number
+  failureKind?: string
+  nextAction?: string
+  retryable?: boolean
 }
 
 export type CodexPanel = {

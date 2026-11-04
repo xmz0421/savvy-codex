@@ -3,7 +3,8 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { AgentRun, Flow, Panel, Phase, PlannedTask } from '../types'
 import type { CodexJob } from '../types'
-import { beginCodexFlow, codexJobs, codexPreviewIsOpen, isActive, refreshCodex, registerCodex, renderCodex, startCodex } from './codex'
+import { absolutePath, beginCodexFlow, cleanText, codexJobs, codexPreviewIsOpen, codexRobotSvg, isActive, readSafe, refreshCodex, registerCodex, renderCodex, sensitivePath, startCodex } from './codex'
+import { activateWorkflow, finishWorkflow, registerWorkflow, savvyWorker, setWorkflowMode, startWorkflow, workflowAllowed, workflowRefusal, workflowState } from './workflow'
 
 const flow = atom({ plugin: 'savvy-codex', key: 'flow' } as const, null)
 const agents = atom({ plugin: 'savvy-codex', key: 'agents' } as const, [])
@@ -16,6 +17,7 @@ const now = atom({ plugin: 'savvy-codex', key: 'now' } as const, 0)
 
 const TOOL = 'mcp__savvy-codex__progress'
 const STEP_TOOL = 'mcp__savvy-codex__step'
+const REVIEW_READ_TOOLS = new Set(['Read', 'Grep', 'Glob', STEP_TOOL])
 // Added to the end of each savvy worker's brief. Their system prompt words step
 // reporting as a condition ("if the step tool appears among your tools") and they
 // skip it even with the tool listed; the same request in the brief is followed.
@@ -32,6 +34,8 @@ const MAX_AFTER = 20
 const MAX_TITLE = 120
 const ACCENT = '#8f8cf4'
 const DONE = '#5fbf8f'
+let showPrices = false
+const PRICE_NOTICE = '上游静态表，未核验；版本日期未知；来源：johnnyvizz/claude-kit 随附表'
 
 type ProgressInput = {
   title?: string
@@ -384,11 +388,11 @@ const TIER_COLOR: Record<string, string> = {
 const colorOf = (tier: string): string => TIER_COLOR[tier] ?? '#888780'
 
 const TIER_MODEL: Record<string, [model: string, effort: string]> = {
-  fable: ['Fable', 'high'],
-  heavy: ['Opus', 'xhigh'],
-  careful: ['Opus', 'high'],
-  medium: ['Opus', 'medium'],
-  light: ['Opus', 'low'],
+  fable: ['inherit', 'high'],
+  heavy: ['inherit', 'xhigh'],
+  careful: ['inherit', 'high'],
+  medium: ['inherit', 'medium'],
+  light: ['inherit', 'low'],
 }
 
 // "Opus · xhigh", with the effort word in the panel's language; '' for an unknown tier.
@@ -408,15 +412,15 @@ const runModel = (a: AgentRun): string => (a.effort ? `${modelName(a.model)} · 
 type Price = [input: number, output: number, cacheRead: number, cacheWrite: number]
 
 const PRICES: [RegExp, Price][] = [
-  [/(fable|mythos)-5-1/, [10, 50, 0.25, 20]],
-  [/fable|mythos/, [10, 50, 1, 20]],
-  [/opus-5-5/, [4, 20, 0.2, 8]],
-  [/opus/, [5, 25, 0.5, 10]],
-  [/sonnet-5-5/, [2, 10, 0.1, 4]],
-  [/sonnet-5/, [2, 10, 0.2, 4]],
-  [/sonnet/, [3, 15, 0.3, 6]],
-  [/haiku-5-5/, [0.1, 0.5, 0.01, 0.2]],
-  [/haiku/, [1, 5, 0.1, 2]],
+  [/^(?:claude-)?(?:fable|mythos)-5-1$/, [10, 50, 0.25, 20]],
+  [/^(?:claude-)?(?:fable|mythos)-5$/, [10, 50, 1, 20]],
+  [/^claude-opus-5-5$/, [4, 20, 0.2, 8]],
+  [/^claude-opus-(?:5|4-8)$/, [5, 25, 0.5, 10]],
+  [/^claude-sonnet-5-5$/, [2, 10, 0.1, 4]],
+  [/^claude-sonnet-5$/, [2, 10, 0.2, 4]],
+  [/^claude-sonnet-4-6$/, [3, 15, 0.3, 6]],
+  [/^claude-haiku-5-5$/, [0.1, 0.5, 0.01, 0.2]],
+  [/^claude-haiku-4-5$/, [1, 5, 0.1, 2]],
 ]
 
 // Haiku 5.5 is priced by prompt length: a request whose prompt (input, cache reads and
@@ -431,17 +435,19 @@ type Usage = {
   cache_creation_input_tokens: number
 }
 
-const priceOf = (model: string, prompt: number): Price => {
+export const priceOf = (model: string, prompt: number): Price | undefined => {
   const id = model.toLowerCase()
-  if (prompt > HAIKU_LONG_PROMPT && /haiku-5-5/.test(id)) return HAIKU_LONG
-  return PRICES.find(([re]) => re.test(id))?.[1] ?? [4, 20, 0.2, 8]
+  if (prompt > HAIKU_LONG_PROMPT && /^claude-haiku-5-5$/.test(id)) return HAIKU_LONG
+  return PRICES.find(([re]) => re.test(id))?.[1]
 }
 
 // `isRequest` says the usage is one model request, which is what a prompt-length price
 // is set by; a turn's sum is priced at the model's ordinary prices.
 const costOf = (model: string, u: Usage, isRequest: boolean): number => {
   const prompt = isRequest ? (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0) : 0
-  const [i, o, r, w] = priceOf(model, prompt)
+  const price = priceOf(model, prompt)
+  if (!price) return 0
+  const [i, o, r, w] = price
   return (
     ((u.input_tokens || 0) * i +
       (u.output_tokens || 0) * o +
@@ -474,6 +480,7 @@ const fmtTokens = (n: number): string =>
   n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : `${Math.round(n)}`
 
 const fmtCost = (usd: number): string => `$${usd < 10 ? usd.toFixed(2) : usd.toFixed(1)}`
+const costText = (a: AgentRun): string => showPrices ? priceOf(a.model, 0) ? ` ≈${fmtCost(a.costUsd)}` : ' 价格未知' : ''
 
 const fmtTime = (ms: number): string => {
   const s = Math.max(0, Math.round(ms / 1000))
@@ -498,25 +505,10 @@ const totals = (list: AgentRun[], at: number) => {
   const tokens = list.reduce((s, a) => s + a.tokens, 0)
   const start = Math.min(...list.map(a => a.startedAt))
   const end = Math.max(...list.map(a => a.endedAt ?? Math.max(at, a.startedAt)))
-  return { cost, tokens, time: list.length ? end - start : 0 }
+  return { cost, tokens, time: list.length ? end - start : 0, count: list.length }
 }
 
-// --- desktop drawings: each row is one SVG, as the band above the prompt is.
-
-// The pane's backdrop: a dotted grid as tall as the content laid over it; the
-// row SVGs are transparent, so it shows through between their marks.
-const GRID_STEP = 16
-// A Text or Button row on the desktop is about 20px; the grid errs taller.
-const LINE_H = 24
-// The engine refuses an Svg taller than 4096px, so a long grid is stacked from
-// tiles of at most this height; a multiple of GRID_STEP keeps the dots aligned.
-const GRID_TILE = 4096
-const gridTiles = (H: number) => Array.from({ length: Math.ceil(H / GRID_TILE) }, (_, i) => Math.min(GRID_TILE, H - i * GRID_TILE))
-const gridSvg = (W: number, H: number) => `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
-<style>.d{fill:#d9d8d4}@media (prefers-color-scheme: dark){.d{fill:#3a3a38}}</style>
-<defs><pattern id="g" width="${GRID_STEP}" height="${GRID_STEP}" patternUnits="userSpaceOnUse"><circle class="d" cx="${GRID_STEP / 2}" cy="${GRID_STEP / 2}" r="1"/></pattern></defs>
-<rect width="${W}" height="${H}" fill="url(#g)"/>
-</svg>`
+// Desktop rows use native clickable titles beside the existing SVG graphics.
 
 const PANE_CSS = `<style>
 .t{fill:#1f1f1f}.s{fill:#6b6b68}.m{fill:#9a9a96}.k{fill:#ecebe8}.ln{stroke:#e4e4e1}.tile{fill:#f4f3f0}
@@ -694,7 +686,7 @@ const headerSvg = (W: number, title: string, t: ReturnType<typeof totals>): stri
     W,
     headerHeight(title),
     `${title ? `<text class="t" ${startText(W, 0, 15)} font-family="${FONT}" font-size="14" font-weight="600">${xml(fitText(title, 14, W))}</text>` : ''}
-${tile(0, s.cost, '≈' + fmtCost(t.cost))}${tile(1, s.tokens, fmtTokens(t.tokens))}${tile(2, s.time, fmtTime(t.time))}`,
+${tile(0, 'Claude', `${t.count} tasks`)}${tile(1, s.tokens, fmtTokens(t.tokens))}${tile(2, s.time, fmtTime(t.time))}`,
   )
 }
 
@@ -720,7 +712,7 @@ const agentSvg = (W: number, a: AgentRun, at: number): string => {
   if (a.status === 'failed') meta.push(s.failed)
   const barW = textW
   const progress = progressOf(a)
-  const stats = `${s.ctx} ${ctx}% · ${fmtTokens(a.contextTokens)}  ≈${fmtCost(a.costUsd)}  ${fmtTime(elapsed(a, at))}`
+  const stats = `${s.ctx} ${ctx}% · ${fmtTokens(a.contextTokens)}${costText(a)}  ${fmtTime(elapsed(a, at))}`
   const steps = a.stepTotal ? `${a.stepDone ?? 0}/${a.stepTotal}${a.stepNote ? ' · ' + a.stepNote : ''}` : ''
   const stepsW = Math.max(0, barW - textWidth(stats, 11) - 12)
   // Without reported steps the bar falls back to the context, drawn grey.
@@ -749,7 +741,7 @@ const plannedSvg = (W: number, p: Planned): string => {
   return svg(
     W,
     46,
-    `${external ? `<text class="s" x="10" y="27" font-family="${FONT}" font-size="16">C</text>` : rowCrab(W, 0, 6, tier, true)}
+    `${external ? `<g transform="translate(1,0) scale(.72)">${codexRobotSvg('queued').replace(/<\/?svg[^>]*>/g, '')}</g>` : rowCrab(W, 0, 6, tier, true)}
 <text class="s" ${startText(W, 42, 18)} font-family="${FONT}" font-size="13" font-weight="600">${xml(fitText(`${p.n}. ${p.title}`, 13, textW))}</text>
 <text ${startText(W, 42, 34)} font-family="${FONT}" font-size="11"><tspan fill="${color}">${xml(external ? '外部 Codex' : tierWord(tier))}</tspan><tspan class="m">  ${xml(meta.filter(Boolean).join('  ·  '))}</tspan></text>
 ${statusMark(mx(W, W - 8), 16, 'planned', color)}
@@ -774,7 +766,7 @@ const compactSvg = (W: number, list: AgentRun[], planned: Planned[], t: ReturnTy
     W,
     32,
     `${body}${more ? `<text class="s" ${startText(W, x, 21, false)} font-family="${FONT}" font-size="12">+${more}</text>` : ''}
-<text class="s" ${endText(W, W, 21)} font-family="${FONT}" font-size="12" font-variant-numeric="tabular-nums">Claude ≈${fmtCost(t.cost)} · ${fmtTokens(t.tokens)} · ${fmtTime(t.time)}</text>`,
+<text class="s" ${endText(W, W, 21)} font-family="${FONT}" font-size="12" font-variant-numeric="tabular-nums">Claude · ${fmtTokens(t.tokens)} · ${fmtTime(t.time)}</text>`,
   )
 }
 
@@ -808,11 +800,14 @@ async function autoOpen($: EngineInterface, key: string): Promise<void> {
 }
 
 export const register: Register = (on, options) => {
+  registerWorkflow(on, options)
   registerCodex(on, options)
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+    await startWorkflow($, options)
     await startCodex($)
     lang = await detectLang($, options.language)
+    showPrices = options.priceEstimates === 'on'
     await $.tool.register({
       name: 'progress',
       description:
@@ -839,7 +834,7 @@ export const register: Register = (on, options) => {
                 tier: { type: 'string', enum: [...TIERS] },
                 provider: { type: 'string', enum: ['claude', 'codex'], description: 'Codex 计划项必须用 codex，不映射到 Claude tier。' },
                 model: { type: 'string', description: 'Codex 计划项的完整模型 id。' },
-                effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'] },
+                effort: { type: 'string', description: 'Codex effort comes from the local model catalog.' },
                 after: { type: 'array', items: { type: 'integer' }, description: 'Numbers of the tasks this one waits for.' },
               },
               required: ['title'],
@@ -908,6 +903,7 @@ export const register: Register = (on, options) => {
       await beginCodexFlow($)
     }
     const next = await update($, flow, p => merge(p, input))
+    if (input.finished === true) await finishWorkflow($)
     if (next && input.tasks?.length) await autoOpen($, next.title)
     return { result: `ok: ${label(next ?? blank())}` }
   })
@@ -930,10 +926,48 @@ export const register: Register = (on, options) => {
     return { result: matched ? 'ok' : `ignored: no panel row for agent ${agentId}` }
   })
 
+  // Observe authorized worker tool activity. This records tool names and public
+  // outcomes, never private model reasoning or unrelated session contents.
+  on('tool.call', async ($, e, next) => {
+    if (!e.agentId) return next(e)
+    const agentId = e.agentId
+    const tool = cleanText(e.tool, 160)
+    const at = await $.clock.now()
+    const tracked = (await read($, agents)).find(a => a.agentId === agentId)
+    if (tracked?.kind?.toLowerCase() === 'review' && !REVIEW_READ_TOOLS.has(tool)) {
+      await update($, agents, list => list.map(a => a.agentId === agentId ? { ...a, activities: [...(a.activities ?? []), { tool, status: 'blocked: read-only review', at }].slice(-80) } : a))
+      return { result: { status: 'blocked', summary: 'Review agents are read-only. Use Read/Grep/Glob and existing validation output; return new execution needs to the lead.' } }
+    }
+    const marker = { tool, status: 'running', at }
+    await update($, agents, list => list.map(a => a.agentId === agentId ? { ...a, activities: [...(a.activities ?? []), marker].slice(-80) } : a))
+    let result: unknown
+    let failed = false
+    try { result = await next(e); return result as never }
+    catch (error) { failed = true; throw error }
+    finally {
+      const raw = result && typeof result === 'object' ? result as Record<string, unknown> : {}
+      failed ||= raw.isError === true || raw.error !== undefined || (raw.result && typeof raw.result === 'object' && (raw.result as Record<string, unknown>).status === 'blocked') === true
+      const input = e as unknown as Record<string, unknown>
+      const candidate = input.file_path ?? input.path
+      await update($, agents, list => list.map(a => {
+        if (a.agentId !== agentId) return a
+        const changed = [...(a.changedFiles ?? [])]
+        if (!failed && /(?:^|__)(?:Write|Edit|MultiEdit)$/i.test(tool) && typeof candidate === 'string') {
+          // Native isolated Claude agents can write in a host worktree outside
+          // the parent's cwd. A successful write grants preview of that exact
+          // observed file, never its directory or other worktree contents.
+          try { const path = absolutePath(candidate); if (!sensitivePath(path) && !changed.includes(path)) changed.push(path) } catch { /* Relative paths with unknown agent cwd grant no access. */ }
+        }
+        return { ...a, changedFiles: changed, activities: (a.activities ?? []).map(item => item === marker || (item.at === at && item.tool === tool && item.status === 'running') ? { ...item, status: failed ? 'failed' : 'complete' } : item) }
+      }))
+    }
+  })
+
   // Safety net: worker launches move the faint layer even if the orchestrator forgets to report.
   on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
     const type = String(e.subagent_type ?? '')
-    if (!type.startsWith('savvy-')) return next(e)
+    if (!savvyWorker(type)) return next(e)
+    if (!await workflowAllowed($)) return { result: { status: 'blocked', summary: await workflowRefusal($) } }
 
     await update($, flow, prev => {
       const base = prev && !prev.isFinished ? { ...blank(), ...prev } : blank()
@@ -947,11 +981,15 @@ export const register: Register = (on, options) => {
   })
 
   on('agent.spawn', async ($, e, next) => {
-    const isUnbriefed = e.subagentType.startsWith('savvy-') && !e.prompt.includes(STEP_TOOL)
+    if (savvyWorker(e.subagentType) && !await workflowAllowed($)) return { deny: await workflowRefusal($) } as never
+    const isUnbriefed = savvyWorker(e.subagentType) && !e.prompt.includes(STEP_TOOL)
     const started = await next(isUnbriefed ? { ...e, prompt: e.prompt + STEP_BRIEF } : e)
     if (started.deny !== undefined) return started
 
     const at = await $.clock.now()
+    let cwd = ''
+    try { cwd = await $.session.cwd() } catch { /* Older hosts may not expose a working directory. */ }
+    const field = (name: string): string => cleanText(new RegExp(`^${name}:[ \\t]*(.*)$`, 'mi').exec(e.prompt)?.[1], 2000).trim()
     await update($, agents, list => {
       const round = 1 + list.filter(a => norm(a.description) === norm(e.description) && e.description).length
       const run: AgentRun = {
@@ -968,11 +1006,17 @@ export const register: Register = (on, options) => {
         costUsd: 0,
         steps: 0,
         round,
+        taskPrompt: cleanText(e.prompt, 256_000),
+        selectionReason: field('SELECTION_REASON') || field('REASON'),
+        workspace: typeof cwd === 'string' ? cwd : '',
+        changedFiles: [], activities: [],
+        kind: field('KIND'), reviewOf: field('REVIEW_OF'), authorProvider: field('AUTHOR_PROVIDER'),
+        attempt: Number(field('ATTEMPT')) || round,
       }
       return [...list.filter(a => a.id !== run.id), run].slice(-200)
     })
     await update($, now, () => at)
-    if (e.subagentType.startsWith('savvy-')) {
+    if (savvyWorker(e.subagentType)) {
       const f = await read($, flow)
       await autoOpen($, f && !f.isFinished ? f.title : 'savvy-codex')
     } else if (options.autoOpen === 'any') {
@@ -1031,6 +1075,8 @@ export const register: Register = (on, options) => {
           return {
             ...a,
             status: e.reason === 'answer' ? 'done' : 'failed',
+            answer: cleanText(e.answer, 256_000),
+            failureKind: e.reason === 'answer' ? '' : cleanText(e.reason, 300),
             endedAt: at,
             ...(fallback && e.usage
               ? {
@@ -1047,6 +1093,9 @@ export const register: Register = (on, options) => {
         }),
       )
       await update($, now, () => at)
+    } else if (e.reason === 'answer') {
+      const [native, external] = await Promise.all([read($, agents), codexJobs($)])
+      if (!native.some(agent => agent.status === 'running') && !external.some(isActive)) await finishWorkflow($)
     }
     return next(e)
   })
@@ -1054,7 +1103,7 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const s = tr()
     const ui = $.ui.resolve(e)
-    const { Box, Text, Button } = ui
+    const { Box, Text, Button, Code } = ui
     const list = await read($, agents)
     const external = await codexJobs($)
     const codexPane = await renderCodex($, e)
@@ -1062,6 +1111,60 @@ export const register: Register = (on, options) => {
     const f = await read($, flow)
     const p: Panel = await read($, panel)
     const at = Math.max(await read($, now), ...list.map(a => a.startedAt), 0)
+    const selected = list.find(a => a.id === p.selectedId)
+    const copy = async (text: string) => { await $.ui.copy({ text, surface: e.surface }) }
+    if (selected) {
+      const files = selected.changedFiles ?? []
+      if (p.previewPath && files.includes(p.previewPath)) return (
+        <Box flexDirection="column" gap={1}>
+          <Button key="claude-preview-back" label="返回任务详情" onPress={() => update($, panel, value => ({ ...value, previewPath: '', previewText: '', previewNote: '' }))} />
+          <Text>{p.previewPath}</Text>
+          <Button key="claude-copy-preview" label="复制路径" onPress={() => copy(p.previewPath!)} />
+          <Button key="claude-copy-text" label="复制内容" onPress={() => copy(p.previewText ?? '')} />
+          {p.previewNote && <Text>{p.previewNote}</Text>}
+          {p.previewText && <Code source={p.previewText} path={p.previewPath} wrap="wrap" />}
+        </Box>
+      )
+      return (
+        <Box key="claude-detail" flexDirection="column" gap={1}>
+          <Button key="claude-list-back" label="返回全部任务" onPress={() => update($, panel, value => ({ ...value, selectedId: '', previewPath: '' }))} />
+          <Text bold>Claude · {selected.description} · {selected.status}</Text>
+          <Text>{selected.model || '模型未知'} · effort {selected.effort || '未知：宿主尚未提供'} · {fmtTokens(selected.tokens)} tokens · {fmtTime(elapsed(selected, at))}{costText(selected)}</Text>
+          {showPrices && <Text>{PRICE_NOTICE}</Text>}
+          <Text>选择依据：{selected.selectionReason || '未知：任务未提供模型与 effort 选择理由。'}</Text>
+          <Text>kind: {selected.kind || '未知'} · review_of: {selected.reviewOf || '无'} · author_provider: {selected.authorProvider || '未知'} · attempt: {selected.attempt ?? '未知'}</Text>
+          {selected.failureKind && <Text>failure_kind: {selected.failureKind}</Text>}
+          {selected.nextAction && <Text>next_action: {selected.nextAction}</Text>}
+          <Text bold>任务全文</Text>
+          <Code source={selected.taskPrompt || '未知：宿主未提供任务正文。'} path="task.txt" wrap="wrap" />
+          <Button key="claude-copy-task" label="复制任务" plain onPress={() => copy(selected.taskPrompt ?? '')} />
+          <Text bold>工具活动</Text>
+          {selected.activities?.length ? selected.activities.map((item, index) => <Text key={`activity-${index}`}>{item.tool} · {item.status}</Text>) : <Text>未知：尚无可见工具事件。</Text>}
+          {selected.answer && <Code source={selected.answer} path="result.txt" wrap="wrap" />}
+          {files.map((path, index) => <Box key={`claude-file-row-${index}`} flexDirection="row" gap={1}>
+            <Button key={`claude-file-${selected.id}-${index}`} label={`查看 ${path}`} plain onPress={async () => {
+              let text = ''; let note = ''
+              try { const source = await readSafe($, path, path); text = cleanText(source, 24_000); if (source.length > text.length) note = '仅预览前 24,000 个字符。' }
+              catch (error) { note = cleanText(String(error), 600) }
+              await update($, panel, value => ({ ...value, previewPath: path, previewText: text, previewNote: note }))
+            }} />
+            <Button key={`claude-copy-${selected.id}-${index}`} label="复制路径" plain onPress={() => copy(path)} />
+          </Box>)}
+          {!files.length && <Text>尚无宿主可确认的写入文件。</Text>}
+        </Box>
+      )
+    }
+    const mode = await workflowState($)
+    const controls = <Box key="workflow-controls" flexDirection="column" gap={1}>
+      <Text>Savvy · {mode.mode} · {await workflowAllowed($) ? '已启用' : '待机'}</Text>
+      <Box flexDirection="row" gap={1}>
+        {mode.mode === 'manual' && !mode.active && <Button key="savvy-start" label="开始本次协作" onPress={() => activateWorkflow($)} />}
+        {mode.mode === 'manual' && mode.active && <Button key="savvy-finish" label="结束本次协作" onPress={() => finishWorkflow($)} />}
+        <Button key="savvy-mode-off" label="关闭" plain onPress={() => setWorkflowMode($, 'off')} />
+        <Button key="savvy-mode-manual" label="手动" plain onPress={() => setWorkflowMode($, 'manual')} />
+        <Button key="savvy-mode-auto" label="自动" plain onPress={() => setWorkflowMode($, 'auto')} />
+      </Box>
+    </Box>
 
     const running = list.filter(a => a.status === 'running').reverse()
     const finished = list.filter(a => a.status !== 'running').reverse()
@@ -1087,7 +1190,7 @@ export const register: Register = (on, options) => {
       />
     )
     const isEmpty = list.length === 0 && external.length === 0 && planned.length === 0
-    const summary = `≈${fmtCost(t.cost)}, ${fmtTokens(t.tokens)} ${s.tokensWord}, ${fmtTime(t.time)}`
+    const summary = `${fmtTokens(t.tokens)} ${s.tokensWord}, ${fmtTime(t.time)}`
 
     if (e.surface === 'desktop' && 'Svg' in ui) {
       const { Svg } = ui
@@ -1103,34 +1206,35 @@ export const register: Register = (on, options) => {
       if (p.isCompact) {
         return (
           <Box flexDirection="column" gap={1} alignItems={align}>
+            {controls}
             <Svg source={compactSvg(W, list, planned, t)} alt={`${list.length} ${s.agentsCount}, ${summary}`} width={W} height={32} />
             {toggleCompact}
             {codexPane}
           </Box>
         )
       }
-      const shownDone = p.isDoneCollapsed ? 0 : finished.length
-      const lines = 1 + (isEmpty ? 1 : 0) + (running.length > 0 ? 1 : 0) + (finished.length > 0 ? 1 : 0) + (planned.length > 0 ? 1 : 0)
-      const gridH = headerHeight(title) + lines * LINE_H + (running.length + shownDone) * 66 + planned.length * 46
       return (
         <Box flexDirection="column">
-          {/* The grid sizes the pane; the content is placed over it, as an
-              absolute Box paints over the siblings before it. */}
-          {gridTiles(gridH).map((tileH, i) => (
-            <Svg key={`grid-${i}`} source={gridSvg(W, tileH)} alt="dotted grid" width={W} height={tileH} />
-          ))}
-          <Box flexDirection="column" position="absolute" top={0} left={0} right={0} alignItems={align}>
+          {controls}
+          <Box flexDirection="column" alignItems={align}>
             <Svg source={headerSvg(W, title, t)} alt={title ? `${title}: ${summary}` : summary} width={W} height={headerHeight(title)} />
+            {showPrices && <Text>{PRICE_NOTICE}</Text>}
             {toggleCompact}
             {isEmpty && <Text dimColor>{s.empty}</Text>}
             {running.length > 0 && section('h-run', `${s.running} · ${running.length}`)}
             {running.map(a => (
-              <Svg key={a.id} source={agentSvg(W, a, at)} alt={`${a.description}: ${modelName(a.model)}, ${s.isRunning}`} width={W} height={66} />
+              <Box key={a.id} flexDirection="column">
+                <Button key={`claude-row-${a.id}`} label={`${a.description || a.type} ›`} plain onPress={() => update($, panel, value => ({ ...value, selectedId: a.id }))} />
+                <Svg source={agentSvg(W, a, at)} alt={`${a.description}: ${modelName(a.model)}, ${s.isRunning}`} width={W} height={66} />
+              </Box>
             ))}
             {finished.length > 0 && toggleDone}
             {!p.isDoneCollapsed &&
               finished.map(a => (
-                <Svg key={a.id} source={agentSvg(W, a, at)} alt={`${a.description}: ${modelName(a.model)}, ${s.isFinished}`} width={W} height={66} />
+                <Box key={a.id} flexDirection="column">
+                  <Button key={`claude-row-${a.id}`} label={`${a.description || a.type} ›`} plain onPress={() => update($, panel, value => ({ ...value, selectedId: a.id }))} />
+                  <Svg source={agentSvg(W, a, at)} alt={`${a.description}: ${modelName(a.model)}, ${s.isFinished}`} width={W} height={66} />
+                </Box>
               ))}
             {planned.length > 0 && section('h-plan', `${s.planned} · ${planned.length}`)}
             {planned.map(pl => (
@@ -1156,9 +1260,7 @@ export const register: Register = (on, options) => {
         <Box key={a.id} flexDirection="column" marginBottom={1}>
           <Box flexDirection="row" gap={1}>
             <Text color={color}>▣</Text>
-            <Text bold wrap="truncate-end">
-              {a.description || a.type}
-            </Text>
+            <Button key={`claude-row-${a.id}`} label={`${a.description || a.type} ›`} plain onPress={() => update($, panel, value => ({ ...value, selectedId: a.id }))} />
             <Text color={a.status === 'failed' ? 'red' : a.status === 'done' ? 'green' : color}>{STATUS_GLYPH[a.status]}</Text>
           </Box>
           <Text dimColor wrap="truncate-end">
@@ -1171,7 +1273,7 @@ export const register: Register = (on, options) => {
             {progress === null ? <Text dimColor>{ctxBar(ctx, barW)}</Text> : <Text color={color}>{ctxBar(progress * 100, barW)}</Text>}
             <Text dimColor>
               {' '}
-              {steps}{s.ctx} {ctx}% · {fmtTokens(a.contextTokens)} ≈{fmtCost(a.costUsd)} {fmtTime(elapsed(a, at))}
+              {steps}{s.ctx} {ctx}% · {fmtTokens(a.contextTokens)}{costText(a)} {fmtTime(elapsed(a, at))}
             </Text>
           </Text>
         </Box>
@@ -1180,6 +1282,7 @@ export const register: Register = (on, options) => {
 
     return (
       <Box flexDirection="column">
+        {controls}
         <Box flexDirection="row" justifyContent="space-between">
           <Text bold wrap="truncate-end">
             {title}
@@ -1187,8 +1290,9 @@ export const register: Register = (on, options) => {
           {toggleCompact}
         </Box>
         <Text dimColor>
-          Claude 估算 ≈{fmtCost(t.cost)} · {fmtTokens(t.tokens)} {s.tokensWord} · {fmtTime(t.time)}
+          {fmtTokens(t.tokens)} {s.tokensWord} · {fmtTime(t.time)}
         </Text>
+        {showPrices && <Text>{PRICE_NOTICE}</Text>}
         {p.isCompact ? (
           <Text wrap="truncate-end">
             {[...running, ...finished].map(a => (
