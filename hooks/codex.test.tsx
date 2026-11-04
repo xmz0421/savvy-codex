@@ -65,6 +65,7 @@ function world(on: On, options: WorldOptions = {}) {
   const runs: { argv: string[]; cwd?: string; timeoutMs?: number }[] = []
   const opened: { id: string; title?: string }[] = []
   const copied: string[] = []
+  const notices: string[] = []
   const reads: string[] = []
   const registered: string[] = []
   const links = new Set<string>()
@@ -81,7 +82,7 @@ function world(on: On, options: WorldOptions = {}) {
   on('command.register', (_$, e) => ok({ command: e.name }))
   on('ui.open', (_$, e) => { opened.push({ id: e.id, title: e.title }); return ok({ isPlaced: true }) })
   on('ui.copy', (_$, e) => { copied.push(e.text); return ok({ isCopied: true }) })
-  on('ui.toast', () => ok(undefined))
+  on('ui.toast', (_$, e) => { notices.push(e.message ?? e.text); return ok(undefined) })
   on('model.complete', () => { modelCalls++; throw new Error('No models are allowed in UI tests') })
   on('fs.stat', (_$, e) => {
     const path = absolutePath(e.path)
@@ -121,7 +122,7 @@ function world(on: On, options: WorldOptions = {}) {
     if (argv[2] === 'cleanup') return response({ status: 'complete', dry_run: argv.includes('--dry-run'), deleted: [], would_delete: [], skipped: [], errors: [] })
     throw new Error('Unexpected helper command')
   })
-  return { clock, files, runs, opened, copied, reads, registered, links, sizes, modelCalls: () => modelCalls }
+  return { clock, files, runs, opened, copied, notices, reads, registered, links, sizes, modelCalls: () => modelCalls }
 }
 
 const start = async ($: Engine) => {
@@ -132,6 +133,60 @@ const call = ($: Engine, value: object) => $.tool.call(value as never)
 const mount = ($: Engine, surface: 'desktop' | 'terminal' = 'desktop') => $.ui.mount({ plugin: 'savvy-codex', surface, component: 'Pane', requestId: 'savvy-agents', props: PANE })
 
 const environment = (env: Record<string, string>) => ({ env: { get: async (key: string) => env[key] } }) as unknown as EngineInterface
+
+test('savvy-start forwards a task once after the command returns, without a helper or wrapper agent', async ($, on) => {
+  const w = world(on)
+  const sent: string[] = []
+  on('prompt.submit', (_$, e) => { sent.push(e.text); return { text: e.text } })
+  await $.session.start({ source: 'startup', cwd: ROOT, surface: 'desktop', isInteractive: true } as never)
+  const task = '检查测试入口\n保留 `literal` 和 $(literal)，按需要选择两家的 worker。'
+  expect(await $.command.run({ command: 'savvy-start', args: task } as never)).toMatchObject({ text: '已启用本次协作，正在将任务提交给当前 Claude 会话。' })
+  expect(sent).toEqual([])
+  await w.clock.advance(1)
+  expect(sent.length).toBe(1)
+  expect(sent[0]).toContain('savvy-codex:savvy-flow')
+  expect(sent[0]).toContain(task)
+  expect(w.runs).toEqual([])
+  expect(w.modelCalls()).toBe(0)
+  await w.clock.advance(POLL_MS)
+  expect(sent.length).toBe(1)
+})
+
+test('savvy-start with no task does not submit; off blocks activation and task forwarding', async ($, on) => {
+  const w = world(on)
+  const sent: string[] = []
+  on('prompt.submit', (_$, e) => { sent.push(e.text); return { text: e.text } })
+  await start($)
+  await w.clock.advance(1)
+  expect(sent).toEqual([])
+  await $.command.run({ command: 'savvy-mode', args: 'off' } as never)
+  await $.command.run({ command: 'savvy-start', args: '不要启动这个任务' } as never)
+  await w.clock.advance(1)
+  expect(sent).toEqual([])
+  expect(await call($, { tool: 'mcp__savvy-codex__workflow_control', action: 'status' })).toMatchObject({ result: { mode: 'off', allowed: false } })
+})
+
+test('a dropped task is visible and consumes the manual activation', async ($, on) => {
+  const w = world(on)
+  on('prompt.submit', () => ({ drop: 'test policy refused delivery' }))
+  await start($)
+  await $.command.run({ command: 'savvy-start', args: '这次任务' } as never)
+  await w.clock.advance(1)
+  expect(await call($, { tool: 'mcp__savvy-codex__workflow_control', action: 'status' })).toMatchObject({ result: { mode: 'manual', allowed: false } })
+  expect(JSON.stringify(w.notices)).toContain('test policy refused delivery')
+})
+
+test('switching off before a queued task is delivered prevents submission', async ($, on) => {
+  const w = world(on)
+  const sent: string[] = []
+  on('prompt.submit', (_$, e) => { sent.push(e.text); return { text: e.text } })
+  await start($)
+  await $.command.run({ command: 'savvy-start', args: '取消这个待提交任务' } as never)
+  await $.command.run({ command: 'savvy-mode', args: 'off' } as never)
+  await w.clock.advance(1)
+  expect(sent).toEqual([])
+  expect(JSON.stringify(w.notices)).toContain('协作已在提交前关闭')
+})
 
 test('worker defaults remain portable and resolve the actual host plugin root', async () => {
   const $ = environment({ OS: 'Windows_NT', CLAUDE_PLUGIN_ROOT: 'C:\\Plugins\\Savvy Codex' })

@@ -24,6 +24,8 @@ echo '{"workflowMode":"manual"}' | claude plugin configure savvy-codex@skills-di
 
 手动试用：新建 Claude Desktop **Code** 会话，运行 `/savvy-start`，再说“用 Savvy 检查这个项目的测试入口，让 Codex 做一次只读调查，显示模型和思考强度”。`/savvy-codex:savvy-flow` 是流程说明入口，单独加载技能不会绕过手动开关。`codex-worker` 是内部组件，不是另一个日常入口。
 
+也可一条命令开启并提交任务，例如：`/savvy-start 检查这个项目的测试入口，按需要安排 Claude 和 Codex 配合`。后面的文字会作为任务交给当前 Claude 会话；不带文字时只开启待机，不调用模型。off 模式仍需先切回 manual 或 auto。
+
 ## 安装和前置检查
 
 需要 Git、Python 3.10+、支持 `claude-code` Mod/function-hooks 的 Claude Code，以及已通过 **ChatGPT 登录**的官方 Codex CLI。已验证的桌面组合为 Windows、Claude Code 2.1.314、Codex CLI 0.166.0；兼容性按实际所需参数/功能检测，旧版 CLI 可能不兼容。普通网页 Chat / Cowork 不保证侧栏能力，macOS / Linux 桌面尚未实测。

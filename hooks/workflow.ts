@@ -38,7 +38,7 @@ export async function startWorkflow($: EngineInterface, options: Record<string, 
     inputSchema: { type: 'object', additionalProperties: false, properties: { action: { type: 'string', enum: ['status', 'finish'] } }, required: ['action'] },
   })
   await $.command.register({ name: 'savvy-mode', description: 'Session Savvy mode: off | manual | auto. No model call; manual requires /savvy-start for each workflow.' })
-  await $.command.register({ name: 'savvy-start', description: 'Explicitly authorize Savvy delegation for the current manual workflow.' })
+  await $.command.register({ name: 'savvy-start', description: 'Start this workflow; optionally append a task to submit it to the current Claude session.' })
 }
 export const registerWorkflow: Register = (on) => {
   on('command.run', { command: 'savvy-mode' }, async ($, event) => {
@@ -47,7 +47,34 @@ export const registerWorkflow: Register = (on) => {
     await setWorkflowMode($, mode)
     return { text: `Savvy: ${mode}${mode === 'manual' ? '；本次需 /savvy-start 或侧栏开始按钮激活。' : '。'}` }
   })
-  on('command.run', { command: 'savvy-start' }, async ($) => ({ text: await activateWorkflow($) ? '已启用本次 Savvy 协作。manual 模式在流程完成后恢复待机。' : await workflowRefusal($) }))
+  on('command.run', { command: 'savvy-start' }, async ($, event) => {
+    const task = String(event.args ?? '').trim()
+    if (task.length > 64_000) return { text: '任务过长；请将详细材料放入项目文件，再提交简短任务。尚未开启协作。' }
+    if (!await activateWorkflow($)) return { text: await workflowRefusal($) }
+    if (!task) return { text: '已启用本次 Savvy 协作。manual 模式在流程完成后恢复待机。' }
+    // Run after command.run returns: awaiting the queued prompt in this handler
+    // could block the composer drain that must deliver it. This is a normal
+    // prompt in the current session, never another CLI or a wrapper agent.
+    $.clock.after(0, () => {
+      void (async () => {
+        try {
+          if (!await workflowAllowed($)) {
+            await $.ui.toast('任务未提交：协作已在提交前关闭。')
+            return
+          }
+          const sent = await $.prompt.submit({ text: 'Savvy collaboration has been explicitly started by the user. Read savvy-codex:savvy-flow, check workflow_control, and carry out the following user task in this session. Choose whether delegation is worthwhile; retain all existing permissions and project constraints.\n\nUser task:\n' + task })
+          if (typeof sent.drop === 'string') {
+            await finishWorkflow($)
+            await $.ui.toast(`任务未提交：${sent.drop.slice(0, 500)}。请重新开启并发送任务。`)
+          }
+        } catch (error) {
+          await finishWorkflow($)
+          await $.ui.toast(`任务提交失败：${String(error).slice(0, 500)}。请重新开启并发送任务。`)
+        }
+      })()
+    })
+    return { text: '已启用本次协作，正在将任务提交给当前 Claude 会话。' }
+  })
   on('tool.call', { tool: WORKFLOW_TOOL }, async ($, event) => {
     if (event.agentId) return { result: { status: 'blocked', summary: 'Only the main session may control the workflow.' } }
     const action = (event as unknown as { action?: string }).action

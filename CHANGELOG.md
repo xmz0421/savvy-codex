@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.4.0-codex.2
+
+- `/savvy-start <task>` activates the workflow and submits the task to the current Claude session after the command returns. Empty arguments only activate; off mode blocks submission. Submission errors are visible and clear manual activation.
+
 ## 1.4.0-codex.1
 
 - Default manual mode with visible off/manual/auto controls. Only user commands/buttons activate manual delegation. Removed unconditional global workflow instructions and source-level auto-trigger requirements.
