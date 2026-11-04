@@ -1,6 +1,6 @@
 {
   "name": "savvy-codex",
-  "version": "1.3.0-codex.1",
+  "version": "1.3.0-codex.2",
   "description": "Savvy orchestration with Claude and subscription-authenticated Codex workers in the same native Agents panel.",
   "author": {
     "name": "xmz0421 (based on johnnyvizz/claude-kit)",
