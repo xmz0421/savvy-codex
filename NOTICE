@@ -1,0 +1,9 @@
+Savvy Codex integrates and modifies Savvy Flow and Savvy Progress from:
+https://github.com/johnnyvizz/claude-kit
+Copyright (c) 2026 johnnyvizz — MIT License (see LICENSE).
+
+This community fork adds official Codex CLI delegation, task/model/effort
+routing, shared Agents-panel integration, and installation tooling.
+Fork maintained at https://github.com/xmz0421/savvy-codex.
+The upstream copyright and license are retained. This fork is not endorsed
+by Anthropic or OpenAI and is not an official upstream release.

@@ -1,0 +1,56 @@
+{
+  "name": "savvy-codex",
+  "version": "1.3.0-codex.1",
+  "description": "Savvy orchestration with Claude and subscription-authenticated Codex workers in the same native Agents panel.",
+  "author": {
+    "name": "xmz0421 (based on johnnyvizz/claude-kit)",
+    "url": "https://github.com/xmz0421"
+  },
+  "homepage": "https://github.com/xmz0421/savvy-codex",
+  "repository": "https://github.com/xmz0421/savvy-codex",
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "pythonPath": {
+      "type": "string",
+      "title": "Python executable",
+      "description": "Python 3.10+ executable path or name; blank uses SAVVY_CODEX_PYTHON, then platform default.",
+      "default": ""
+    },
+    "pluginRoot": {
+      "type": "string",
+      "title": "Plugin directory override",
+      "description": "Optional absolute plugin root; blank uses environment or the skills-dir install location.",
+      "default": ""
+    },
+    "helperPath": {
+      "type": "string",
+      "title": "Executor script override",
+      "description": "Optional absolute codex_delegate.py path for custom installations.",
+      "default": ""
+    },
+    "language": {
+      "type": "string",
+      "title": "Panel language",
+      "description": "Agents 侧栏语言；auto 跟随 Claude Code 设置与系统语言。",
+      "default": "zh",
+      "options": [
+        "auto",
+        "zh",
+        "en",
+        "ru",
+        "he"
+      ]
+    },
+    "autoOpen": {
+      "type": "string",
+      "title": "Open the agents panel",
+      "description": "savvy 由流程或 Codex worker 启动时打开同一侧栏；any 也跟随普通 Claude 子代理。",
+      "default": "savvy",
+      "options": [
+        "savvy",
+        "any"
+      ]
+    }
+  }
+}
