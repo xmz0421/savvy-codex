@@ -35,7 +35,7 @@ def response(status="complete"):
 class WorkerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="codex-worker-test-")
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.workspace = self.root / "workspace with spaces"
         self.workspace.mkdir()
         (self.workspace / "example.py").write_text("def example(x):\n    return x + 1\n", encoding="utf-8")
@@ -98,7 +98,7 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(original["OPENAI_API_KEY"], "secret")
 
     def test_cli_discovery_prefers_native_executable(self):
-        with mock.patch.object(worker.shutil, "which", side_effect=lambda name: str(self.root / "codex.exe") if name == "codex.exe" else "wrong-shim"):
+        with mock.patch.object(worker.shutil, "which", side_effect=lambda name: str(self.root / "codex.exe") if name == "codex.exe" else None):
             self.assertEqual(worker.discover_cli(), [str((self.root / "codex.exe").resolve())])
 
     def test_cli_discovery_uses_node_with_official_npm_shim(self):
