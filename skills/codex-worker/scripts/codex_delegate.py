@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Delegate one bounded task to the installed official Codex CLI.
 
-Standard library only. No authentication material is read or copied. The installed
-CLI retains its own configuration, login, Windows sandbox and execpolicy rules.
+Standard library only. Auth/config are fingerprinted locally for cache invalidation;
+their contents never enter task artifacts. The installed CLI retains its login and
+execpolicy rules; sandbox settings are constrained explicitly for each worker.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import queue
 from pathlib import Path
 import re
 import shutil
@@ -19,6 +21,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 import uuid
@@ -96,14 +99,89 @@ def now():
 
 
 def read_json(path):
-    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    with shared_read(path) as handle:
+        return json.loads(handle.read().decode("utf-8-sig"))
+
+
+@contextlib.contextmanager
+def shared_read(path):
+    """Readers permit atomic replacement on Windows, including long-held reads."""
+    if os.name != "nt":
+        with open(path, "rb") as handle:
+            yield handle
+        return
+    import ctypes
+    import msvcrt
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+    api.CreateFileW.restype = ctypes.c_void_p
+    raw = api.CreateFileW(str(Path(path)), 0x80000000, 7, None, 3, 0x80, None)
+    if raw == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        fd = msvcrt.open_osfhandle(raw, os.O_RDONLY | os.O_BINARY)
+    except BaseException:
+        api.CloseHandle(ctypes.c_void_p(raw))
+        raise
+    with os.fdopen(fd, "rb") as handle:
+        yield handle
 
 
 def write_json(path, value):
     path = Path(path)
-    temp = path.with_name(path.name + ".tmp")
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(temp, path)
+    temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        for attempt in range(10):
+            try:
+                atomic_replace(temp, path)
+                break
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.025 * (attempt + 1))
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def atomic_replace(source, target):
+    if os.name != "nt":
+        os.replace(source, target)
+        return
+    # MoveFileExW (used by os.replace) can still refuse an open destination on
+    # Windows. POSIX rename semantics allow replacement while shared-delete
+    # readers retain their old file handle. No non-atomic unlink fallback.
+    import ctypes
+    from ctypes import wintypes
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.CreateFileW.argtypes = [ctypes.c_wchar_p, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+    api.CreateFileW.restype = ctypes.c_void_p
+    api.SetFileInformationByHandle.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    api.CloseHandle.argtypes = [ctypes.c_void_p]
+    handle = api.CreateFileW(str(source), 0x10000, 7, None, 3, 0x80, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    class Rename(ctypes.Structure):
+        _fields_ = [("Flags", wintypes.DWORD), ("RootDirectory", ctypes.c_void_p),
+                    ("FileNameLength", wintypes.DWORD), ("FileName", ctypes.c_wchar * 1)]
+    # Preserve replace semantics: replace a symlink name rather than following
+    # its destination. Only normalize to an absolute path, never resolve links.
+    name = os.path.abspath(target).encode("utf-16-le")
+    buffer = ctypes.create_string_buffer(Rename.FileName.offset + len(name) + 2)
+    info = Rename.from_buffer(buffer)
+    info.Flags = 3  # REPLACE_IF_EXISTS | POSIX_SEMANTICS
+    info.FileNameLength = len(name)
+    ctypes.memmove(ctypes.addressof(buffer) + Rename.FileName.offset, name, len(name))
+    try:
+        if not api.SetFileInformationByHandle(handle, 22, buffer, len(buffer)):
+            error = ctypes.get_last_error()
+            if error not in {1, 50, 87}:  # Older filesystem/platform, retain safe fallback.
+                raise ctypes.WinError(error)
+        else:
+            return
+    finally:
+        api.CloseHandle(handle)
+    os.replace(source, target)
 
 
 def codex_home():
@@ -198,7 +276,193 @@ def check_auth(cli, env):
     return {"verified": True, "method": "ChatGPT", "checked_at": now()}
 
 
-def capabilities(cli, env):
+def sandbox_policy(permission):
+    return {"mode": permission, "approval": "auto-review" if permission == "workspace-write" else "never",
+            "writable_roots": [], "exclude_tmpdir_env_var": True, "exclude_slash_tmp": True,
+            "source_workspace_writable": False, "mechanism": "explicit CLI config overrides; effective config/read verified before inference"}
+
+
+def write_sandbox_arguments():
+    return ["--approve-for-me", "-c", 'sandbox_mode="workspace-write"',
+            "-c", "sandbox_workspace_write.writable_roots=[]",
+            "-c", "sandbox_workspace_write.network_access=false",
+            "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+            "-c", "sandbox_workspace_write.exclude_slash_tmp=true"]
+
+
+def verify_effective_sandbox(cli, env, cwd=None):
+    """Read merged requirements/profile policy over local RPC, without a model turn.
+
+    Fail closed on unsupported protocol, conflicting modern permissions or any
+    broader policy. Never persist config/read's unfiltered response.
+    """
+    command = cli + overrides() + write_sandbox_arguments() + ["app-server", "--stdio"]
+    child = subprocess.Popen(command, shell=False, env=env, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="strict",
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
+    replies = queue.Queue()
+    def read():
+        try:
+            for line in child.stdout:
+                try:
+                    replies.put(json.loads(line))
+                except ValueError:
+                    continue
+        finally:
+            replies.put(None)
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    def send(value):
+        child.stdin.write(json.dumps(value) + "\n")
+        child.stdin.flush()
+    def receive(identifier):
+        deadline = time.monotonic() + 15
+        while True:
+            value = replies.get(timeout=max(0, deadline - time.monotonic()))
+            if value is None or "error" in value:
+                raise WorkerError("CLI effective sandbox configuration could not be verified; no model was started.", "permission")
+            if value.get("id") == identifier:
+                return value
+    try:
+        send({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "savvy-policy-check", "version": "1"}, "capabilities": {"experimentalApi": True}}})
+        receive(1)
+        send({"method": "initialized", "params": {}})
+        send({"id": 2, "method": "config/read", "params": {"includeLayers": False}})
+        config = receive(2).get("result", {}).get("config", {})
+        workspace = config.get("sandbox_workspace_write") or {}
+        if (config.get("default_permissions") or config.get("permissions")
+                or config.get("sandbox_mode") != "workspace-write"
+                or workspace.get("writable_roots") != []
+                or workspace.get("network_access") is not False
+                or workspace.get("exclude_tmpdir_env_var") is not True
+                or workspace.get("exclude_slash_tmp") is not True):
+            raise WorkerError("Effective Codex policy conflicts with the required isolated workspace sandbox (including modern permissions profiles or extra writable roots). Use a compatible existing configuration; no config was changed and no model was started.", "permission")
+        return {"verified": True, "mode": "workspace-write", "writable_roots": [], "network_access": False,
+                "exclude_tmpdir_env_var": True, "exclude_slash_tmp": True, "model_turns": 0}
+    except (queue.Empty, BrokenPipeError, ValueError) as exc:
+        raise WorkerError("CLI effective sandbox policy verification failed; no model was started.", "permission") from exc
+    finally:
+        child.stdin.close()
+        try:
+            child.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            kill_child_tree(child)
+        reader.join(timeout=1)
+        child.stdout.close()
+
+
+def save_progress(state):
+    try:
+        write_json(state["artifacts"]["state"], state)
+    except OSError as exc:
+        # Status is best effort while a child runs. Its real result and artifacts
+        # are still collected, even if an unrelated reader temporarily locks it.
+        state["state_write_warning"] = f"Progress state persistence delayed: {type(exc).__name__}"
+
+
+def snapshot_state(snapshot):
+    """Bound panel metadata, retaining complete enforcement hashes in memory."""
+    result = {key: snapshot[key] for key in ("path", "strategy", "source_workspace", "scope_paths", "scope_entries", "read_only_evidence_paths", "context_paths", "implicit_context_paths", "dependency_paths", "dependency_copy", "verification_output_entries", "notice")}
+    for field, count_field in (("read_only_paths", "read_only_file_count"), ("omitted_paths", "omitted_path_count")):
+        values = snapshot[field]
+        sample = []
+        size = 0
+        for value in values[:100]:
+            size += len(value.encode("utf-8"))
+            if size > 16 * 1024:
+                break
+            sample.append(value)
+        result[field] = sample
+        result[count_field] = len(values)
+        result[field + "_truncated"] = len(sample) < len(values)
+    return result
+
+
+def verification_environment(snapshot, permission, env):
+    """Redirect temporary files only into an explicitly authorized new output dir."""
+    result = dict(env)
+    directories = [entry for entry in snapshot.get("verification_output_entries", []) if entry["type"] == "directory"]
+    if permission != "workspace-write" or not directories:
+        return result, None
+    workspace = Path(snapshot["path"])
+    output = workspace / directories[0]["path"]
+    temporary = output / "tmp"
+    scope_snapshot.ordinary_path(temporary, workspace)
+    temporary.mkdir(parents=True, exist_ok=True)
+    for name in ("TMP", "TEMP", "TMPDIR"):
+        result[name] = str(temporary)
+    result["SAVVY_VERIFICATION_OUTPUT_DIR"] = str(output)
+    return result, temporary.relative_to(workspace).as_posix()
+
+
+PREFLIGHT_TTL = 60
+
+
+def preflight_fingerprint(cli):
+    facts = []
+    for value in cli:
+        path = Path(value)
+        info = path.stat()
+        facts.append((str(path.resolve()), info.st_size, info.st_mtime_ns))
+    # Only fingerprints leave this function, never configuration/auth contents.
+    for name in ("config.toml", "auth.json", "requirements.toml"):
+        path = codex_home() / name
+        try:
+            with shared_read(path) as handle:
+                digest = hashlib.sha256(handle.read()).hexdigest()
+            info = path.stat()
+            facts.append((str(path), info.st_mtime_ns, digest))
+        except FileNotFoundError:
+            facts.append((str(path), None))
+    return hashlib.sha256(json.dumps(facts).encode()).hexdigest()
+
+
+def preflight(cli, env, directory, cwd=None):
+    """Cross-controller positive cache; CLI/config/auth changes always invalidate."""
+    cache_path = Path(directory) / "preflight-cache.json"
+    try:
+        fingerprint = preflight_fingerprint(cli)
+    except OSError:
+        # Fake/test CLIs or unavailable fingerprint inputs are never cached.
+        caps, auth = capabilities(cli, env, cwd), check_auth(cli, env)
+        return dict(caps, preflight_cache={"hit": False, "enabled": False}), dict(auth, cached=False, scope="local_login_status")
+    try:
+        cached = read_json(cache_path)
+        age = time.time() - cached["created"]
+        if cached["fingerprint"] == fingerprint and 0 <= age < PREFLIGHT_TTL:
+            # Managed/project layers can change independently of CODEX_HOME.
+            # Cache expensive CLI feature/help discovery, but verify merged
+            # sandbox policy again before each real launch (zero model turns).
+            # OS-keyring backed login may change without an auth.json update.
+            auth_cached = (codex_home() / "auth.json").is_file()
+            try:
+                policy = verify_effective_sandbox(cli, env, cwd)
+                auth = cached["authentication"] if auth_cached else check_auth(cli, env)
+            except BaseException:
+                cache_path.unlink(missing_ok=True)
+                raise
+            return (dict(cached["capabilities"], sandbox_configuration=policy, preflight_cache={"hit": True, "enabled": True, "age_seconds": round(age, 2), "ttl_seconds": PREFLIGHT_TTL, "authentication_cached": auth_cached, "sandbox_policy_cached": False}),
+                    dict(auth, cached=auth_cached, scope="local_login_status"))
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    try:
+        caps, auth = capabilities(cli, env, cwd), check_auth(cli, env)
+        if preflight_fingerprint(cli) == fingerprint:
+            try:
+                write_json(cache_path, {"fingerprint": fingerprint, "created": time.time(), "capabilities": caps, "authentication": auth})
+            except OSError:
+                pass
+        else:
+            raise WorkerError("CLI, authentication or configuration changed during preflight; create an explicit new attempt.", "auth")
+        return (dict(caps, preflight_cache={"hit": False, "enabled": True, "ttl_seconds": PREFLIGHT_TTL, "authentication_cached": False}),
+                dict(auth, cached=False, scope="local_login_status"))
+    except BaseException:
+        cache_path.unlink(missing_ok=True)
+        raise
+
+
+def capabilities(cli, env, cwd=None):
+    validate_sandbox_configuration()
     result = capture(cli + ["--version"], env)
     version = result.stdout.strip()
     if result.returncode != 0 or not re.match(r"codex(?:-cli)?\s+\d", version, re.I):
@@ -210,11 +474,30 @@ def capabilities(cli, env):
     missing = REQUIRED_FEATURES - available
     if missing:
         raise WorkerError("Installed Codex is missing required isolation features: " + ", ".join(sorted(missing)))
-    result = capture(cli + ["exec", "--help"], env)
+    result = capture(cli + ["--approve-for-me", "-c", 'sandbox_mode="workspace-write"',
+                            "-c", "sandbox_workspace_write.writable_roots=[]", "exec", "--help"], env)
     required = ("--approve-for-me", "--output-schema", "--json", "--output-last-message")
     if result.returncode != 0 or any(flag not in result.stdout for flag in required):
         raise WorkerError("Installed Codex exec does not support the required guarded worker options.")
-    return {"version": version, "features_verified": sorted(REQUIRED_FEATURES)}
+    return {"version": version, "features_verified": sorted(REQUIRED_FEATURES),
+            "sandbox_override_flags_parsed": True,
+            "sandbox_configuration": verify_effective_sandbox(cli, env, cwd)}
+
+
+def validate_sandbox_configuration():
+    """Legacy overrides cannot safely coexist with modern permission profiles.
+
+    Reject these configurations rather than silently inherit a broader profile.
+    Conservative matching also covers inactive profiles, without modifying config.
+    """
+    path = codex_home() / "config.toml"
+    try:
+        with shared_read(path) as handle:
+            config = handle.read().decode("utf-8-sig")
+    except FileNotFoundError:
+        return
+    if re.search(r"(?m)^\s*(?:default_permissions|permissions)\s*=|^\s*\[[^\]\n]*\bpermissions(?:\.|\])", config):
+        raise WorkerError("Codex config uses modern default_permissions/permissions profiles, which conflict with this worker's explicit legacy sandbox overrides. No model was started. Use a compatible existing configuration or update the worker policy adapter; existing config was preserved.", "permission")
 
 
 def overrides():
@@ -302,7 +585,7 @@ def within(path, root):
         return False
 
 
-def normalize_scope(workspace, values):
+def normalize_scope(workspace, values, dependencies=False):
     if not isinstance(values, list) or any(not isinstance(p, str) or not p.strip() for p in values):
         raise WorkerError("scope_paths must be a list of nonempty literal paths, without glob patterns.")
     paths = []
@@ -319,7 +602,7 @@ def normalize_scope(workspace, values):
             scope_snapshot.ordinary_path(path, workspace)
         except scope_snapshot.SnapshotError as exc:
             raise WorkerError(str(exc), "validation") from exc
-        if scope_snapshot.sensitive(path.relative_to(workspace)):
+        if scope_snapshot.sensitive(path.relative_to(workspace)) or (not dependencies and scope_snapshot.dependency_path(path.relative_to(workspace))):
             raise WorkerError(f"Sensitive or runtime scope is not allowed: {value}", "validation")
         if path not in paths:
             paths.append(path)
@@ -335,6 +618,8 @@ def validate_packet(packet, workspace, permission=None, approval=None):
     kind = packet.get("kind")
     if kind not in READ_KINDS | {"implement"}:
         raise WorkerError("kind must be inspect, review, plan, or implement.")
+    if kind in READ_KINDS and packet.get("verification_output_paths"):
+        raise WorkerError("Read-only tasks cannot authorize verification writes. Use checks that produce no files (for example Python -B) or have the lead run output-producing checks in its explicitly authorized implementation task.", "validation")
     acceptance = packet.get("acceptance")
     if isinstance(acceptance, str):
         valid_acceptance = bool(acceptance.strip())
@@ -343,6 +628,17 @@ def validate_packet(packet, workspace, permission=None, approval=None):
     if not valid_acceptance:
         raise WorkerError("acceptance must be a nonempty string or list of strings.")
     scopes = normalize_scope(workspace, packet.get("scope_paths"))
+    for field in ("context_paths", "dependency_paths", "verification_output_paths"):
+        values = packet.get(field, [])
+        normalized = normalize_scope(workspace, values, dependencies=field == "dependency_paths")
+        # One canonical project-relative identity must serve staging, overlap
+        # checks and hash validation, including review candidate relocation.
+        packet[field] = [path.relative_to(workspace).as_posix() + ("/" if any(
+            Path(os.path.abspath(Path(value).expanduser() if Path(value).expanduser().is_absolute() else workspace / value)) == path
+            and value.endswith(("/", "\\")) for value in values) else "") for path in normalized]
+    for field in ("title", "plan_task_id"):
+        if field in packet and (not isinstance(packet[field], str) or not packet[field].strip()):
+            raise WorkerError(field + " must be a nonempty string.", "validation")
     if not scopes:
         raise WorkerError("Task requires at least one explicit authorized scope path.", "validation")
     for field in ("parent_job", "review_of"):
@@ -397,7 +693,7 @@ class WorkspaceLock:
         except OSError as exc:
             self.handle.close()
             self.handle = None
-            raise WorkerError("Another worker owns this workspace lock; use status instead of resubmitting.") from exc
+            raise WorkerError("Another worker owns this job lock; use status instead of resubmitting.") from exc
         return self
 
     def __exit__(self, *args):
@@ -462,8 +758,9 @@ def initialize_run(args, queued=False):
                 "review_of": getattr(args, "review_of", None) or preview.get("review_of"),
                 "attempt": getattr(args, "attempt", None) or preview.get("attempt", 1),
                 "scope_paths": preview.get("scope_paths", []), "execution_workspace": None,
+                **{key: preview.get(key, [] if key.endswith("_paths") else None) for key in ("title", "plan_task_id", "context_paths", "dependency_paths", "verification_output_paths")},
                 "task_prompt": preview.get("goal"),
-                "task_packet": {key: preview[key] for key in ("goal", "reason", "context", "acceptance", "tests", "scope_paths", "kind", "author_provider", "review_of") if key in preview},
+                "task_packet": {key: preview[key] for key in ("title", "plan_task_id", "context_paths", "dependency_paths", "verification_output_paths", "goal", "reason", "context", "acceptance", "tests", "scope_paths", "kind", "author_provider", "review_of") if key in preview},
                 **clear_failure()}
     state = {"version": VERSION, "id": job_id, "job_id": job_id, "workspace": str(workspace), "run_dir": str(run_dir),
              "status": "queued" if queued else "preparing", "started_at": now(), "finished_at": None,
@@ -525,9 +822,9 @@ def build_command(cli, workspace, model, effort, permission, artifacts):
     command = cli + overrides() + ["-c", "model_reasoning_effort=" + json.dumps(effort)]
     if permission == "read-only":
         command += ["-a", "never", "-s", "read-only"]
-    # --approve-for-me conflicts with -a/-s, so it must stand alone.
+    # CLI shorthand conflicts with -s, but explicit config overrides are accepted.
     else:
-        command += ["--approve-for-me"]
+        command += write_sandbox_arguments()
     command += [
         "exec", "--model", model, "--cd", str(workspace), "--skip-git-repo-check",
         "--ephemeral", "--json", "--color", "never",
@@ -545,9 +842,16 @@ def build_prompt(packet, scopes, permission):
         "inspect/copy authentication tokens, or switch provider/billing. Preserve existing dirty files and never reset/clean the repository. "
         f"Permission: {permission}. Scope paths: {json.dumps([str(p) for p in scopes], ensure_ascii=False)}. "
         "For implementation, modify only scope paths. For read-only tasks, do not modify workspace files. "
+        "context_paths, dependency_paths and copied project instructions are immutable read-only inputs. "
+        "verification_output_paths authorize only new verification artifacts, excluded from source patches. "
+        "For an implementation with an explicitly authorized output directory, TMP/TEMP/TMPDIR point to its tmp subdirectory; "
+        "place pytest cache and other test artifacts under SAVVY_VERIFICATION_OUTPUT_DIR as well (for example pytest -o cache_dir=<output>/.pytest_cache). "
+        "Without such a directory, writing test temporary files is not authorized: choose a check without file outputs or report this exact limitation as blocked. "
         "Your cwd is an independent allowlist snapshot of the current authorized inputs. "
         "All work and checks must use this snapshot. Do not locate, read or write the original source workspace, "
-        "parent runtime directories, private baseline repository, system credentials or any path outside this cwd. "
+        "parent runtime directories, private baseline repository or system credentials. "
+        "You may execute the configured existing language runtimes and their installed standard dependencies; "
+        "do not install environments or use the original project for tests. "
         "The controller will validate the actual snapshot delta and export a patch for review; do not apply or merge it elsewhere. "
         "Scope copying and delivery validation are not a per-file OS sandbox; comply with the host sandbox. "
         "Run only checks useful for the stated acceptance; do not perform an unrelated repository audit. "
@@ -751,7 +1055,7 @@ def write_report(state, result):
 
 
 def metadata_fields():
-    return ("kind", "review_of", "parent_job", "author_provider", "execution_provider", "attempt", "scope_paths", "execution_workspace", "review_source_job", "failure_kind", "next_action", "retryable")
+    return ("title", "plan_task_id", "context_paths", "dependency_paths", "verification_output_paths", "kind", "review_of", "parent_job", "author_provider", "execution_provider", "attempt", "scope_paths", "execution_workspace", "review_source_job", "failure_kind", "next_action", "retryable")
 
 
 def attach_result_metadata(state, result):
@@ -771,7 +1075,7 @@ def run_task(args):
     artifacts = state["artifacts"]
     result = None
     try:
-        with WorkspaceLock(directory / "workspace.lock"):
+        with WorkspaceLock(Path(state["run_dir"]) / "job.lock"):
             if not workspace.is_dir():
                 raise WorkerError("Workspace must be an existing directory.")
             if os.environ.get("CLAUDE_CODEX_WORKER") == "1" or os.environ.get("MANIFOLD_COLLAB_WORKER") == "1":
@@ -836,36 +1140,48 @@ def run_task(args):
                     if field == "parent_job" and "attempt" not in packet:
                         packet["attempt"] = int(prior.get("attempt", 1)) + 1
             state.update(reason=packet["reason"], goal=packet["goal"], task=packet["goal"], permission=permission, approval=approval,
+                         **{field: packet.get(field, []) for field in ("context_paths", "dependency_paths", "verification_output_paths")},
                          kind=packet["kind"], scope_paths=[scope.relative_to(workspace).as_posix() for scope in scopes],
                          parent_job=packet.get("parent_job"), review_of=packet.get("review_of"), attempt=packet.get("attempt", 1),
                          author_provider=packet.get("author_provider", "codex"))
-            snapshot = scope_snapshot.prepare(snapshot_source, snapshot_scopes, Path(state["run_dir"]), packet["scope_paths"], evidence_files)
+            snapshot = scope_snapshot.prepare(snapshot_source, snapshot_scopes, Path(state["run_dir"]), packet["scope_paths"], evidence_files,
+                                              packet.get("context_paths", []), packet.get("dependency_paths", []), packet.get("verification_output_paths", []))
+            summary = snapshot_state(snapshot)
+            packet["staged_read_only_paths"] = summary["read_only_paths"]
+            packet["staged_read_only_paths_truncated"] = summary["read_only_paths_truncated"]
+            packet["read_only_file_count"] = summary["read_only_file_count"]
+            packet["implicit_context_paths"] = snapshot["implicit_context_paths"]
             execution = Path(snapshot["path"])
-            state["execution_workspace"] = {key: snapshot[key] for key in ("path", "strategy", "source_workspace", "scope_paths", "scope_entries", "omitted_paths", "read_only_evidence_paths", "notice")}
+            state["execution_workspace"] = summary
             write_json(artifacts["packet"], packet)
             write_json(artifacts["state"], state)
             env = child_environment()
             cli = discover_cli()
             state["cli"] = cli
-            state["capabilities"] = capabilities(cli, env)
-            state["authentication"] = check_auth(cli, env)
+            state["capabilities"], state["authentication"] = preflight(cli, env, directory, execution)
+            state["preflight_cache"] = state["capabilities"].get("preflight_cache")
+            state["sandbox_policy"] = sandbox_policy(permission)
             catalog = cached_catalog()
             verify_model(catalog, args.model, args.effort)
             state["catalog"] = {key: value for key, value in catalog.items() if key != "models"}
+            env, temporary_directory = verification_environment(snapshot, permission, env)
+            packet["verification_temp_directory"] = temporary_directory
+            state["verification_temp_directory"] = temporary_directory
+            write_json(artifacts["packet"], packet)
             write_json(artifacts["schema"], RESPONSE_SCHEMA)
             command = build_command(cli, execution, args.model, args.effort, permission, artifacts)
             state["command"] = command
             def started(pid):
                 state.update(status="running", child_pid=pid, updated_at=now(), progress="working", summary="Codex is working on the task.")
-                write_json(artifacts["state"], state)
+                save_progress(state)
             def progress():
                 evidence = event_evidence(artifacts["events"])
                 fields = {"last_tool": evidence["last_tool"], "last_message": evidence["last_message"], "changed_files": sorted(evidence["file_changes"])}
                 if any(state.get(key) != value for key, value in fields.items()):
                     state.update(fields, updated_at=now())
-                    write_json(artifacts["state"], state)
+                    save_progress(state)
             execution_scopes = [execution / entry["path"] for entry in snapshot["scope_entries"]]
-            prompt_scopes = execution_scopes + [execution / path for path in snapshot["read_only_evidence_paths"]]
+            prompt_scopes = execution_scopes
             returncode = execute(command, build_prompt(packet, prompt_scopes, permission), execution, env, args.timeout, artifacts, started, progress)
             state["cli_exit_code"] = returncode
             evidence = event_evidence(artifacts["events"])
@@ -1008,7 +1324,10 @@ def doctor():
     result = {"status": "blocked", "ready": False, "cli": None, "capabilities": None,
               "authentication": {"verified": False, "method": "ChatGPT"}, "checks": {}, "models": [],
               "python": {"executable": sys.executable, "version": sys.version.split()[0]},
-              "config_preserved": True, "provider": "openai", "billing": "ChatGPT subscription; no per-token dollar estimate",
+              "config_preserved": True, "preflight_cache": {"hit": False, "forced_refresh": True},
+              "sandbox_policy": sandbox_policy("workspace-write"),
+              "read_only_sandbox_policy": sandbox_policy("read-only"),
+              "provider": "openai", "billing": "ChatGPT subscription; no per-token dollar estimate",
               "proxy_environment_names": sorted(key for key in env if key.upper().endswith("_PROXY")), "model_calls": 0}
     failures = []
     cli = None

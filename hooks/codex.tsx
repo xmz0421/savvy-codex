@@ -1,6 +1,8 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderElement, RenderSurface } from 'claude-code'
 import type { CodexJob, CodexPanel, CodexResult, CodexStatus, Effort } from '../types'
+import { pathPolicy } from '../shared/path-policy'
+import { answer } from './tool-result'
 import { workflowAllowed, workflowRefusal } from './workflow'
 
 // These are external official Codex CLI workers. They never impersonate a Claude
@@ -86,15 +88,16 @@ export function normalizeScopes(workspace: string, value: unknown): string[] {
   return strings(value).flatMap(scope => {
     try {
       const path = absolutePath(/^(?:[A-Za-z]:[\\/]|\/)/.test(scope) ? scope : `${root}/${scope}`)
-      return within(root, path) && !samePath(root, path) && !sensitivePath(path) ? [path.slice(root.length + 1)] : []
+      return within(root, path) && !samePath(root, path) && !sensitivePath(path.slice(root.length + 1)) ? [path.slice(root.length + 1)] : []
     } catch { return [] }
   }).filter((scope, index, all) => all.indexOf(scope) === index)
 }
 
 export function sensitivePath(path: string): boolean {
-  return path.replace(/\\/g, '/').split('/').some(part =>
-    /^(?:\.env(?:\..*)?|\.ssh|\.aws|\.azure|\.gnupg|\.kube|\.git|\.npmrc|\.netrc|\.pypirc|auth\.json|credentials(?:\..*)?|secrets?(?:\..*)?|tokens?(?:\..*)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?)$/i.test(part) ||
-    /\.(?:pem|key|p12|pfx|keystore)$/i.test(part),
+  return path.replace(/\\/g, '/').toLowerCase().split('/').some(part =>
+    pathPolicy.denied_path_parts.includes(part) || pathPolicy.denied_exact_names.includes(part) ||
+    pathPolicy.denied_name_prefixes.some(prefix => part.startsWith(prefix)) ||
+    pathPolicy.denied_extensions.some(extension => part.endsWith(extension)),
   )
 }
 
@@ -107,11 +110,11 @@ function ancestors(path: string): string[] {
 }
 
 export async function readSafe($: EngineInterface, path: string, root: string, maxBytes = MAX_PREVIEW): Promise<string> {
-  if (!within(root, path) || sensitivePath(path)) throw new Error('该路径不在允许查看的任务文件中，或属于凭证文件。')
+  if (!within(root, path) || sensitivePath(samePath(root, path) ? path.split('/').pop()! : path.slice(root.replace(/\/$/, '').length + 1))) throw new Error('该路径不在允许查看的任务文件中，或属于凭证文件。')
   let size = 0
   for (const [index, part] of ancestors(path).entries()) {
     const info = await $.fs.stat(part)
-    if (info.isLink) throw new Error('拒绝通过符号链接或目录联接读取文件。')
+    if (info.isLink) throw new Error('宿主未提供安全 realpath API；无法验证符号链接或目录联接，预览受限。')
     const last = index === ancestors(path).length - 1
     if (last) {
       if (info.kind !== 'file') throw new Error('该路径不是普通文件。')
@@ -119,8 +122,10 @@ export async function readSafe($: EngineInterface, path: string, root: string, m
       if (!Number.isFinite(size) || size > maxBytes) throw new Error(`文件超过 ${Math.round(maxBytes / 1024)} KiB 预览上限。`)
     } else if (info.kind !== 'dir') throw new Error('路径的父级不是目录。')
   }
+  // fs.read exposes decoded text only; U+FFFD is also a legal Unicode character.
+  // Actual decoding errors can only be detected/reported by this host API.
   const text = String(await $.fs.read(path))
-  if (text.length > maxBytes || text.includes('\0') || text.includes('\uFFFD')) throw new Error('文件不是可安全显示的 UTF-8 文本。')
+  if (text.length > maxBytes || text.includes('\0')) throw new Error('文件不是可安全显示的 UTF-8 文本。')
   // Guard growth between stat and read as well as broken byte decoders.
   if (new TextEncoder().encode(text).length > maxBytes) throw new Error('读取时文件超过预览上限。')
   return text.replace(/^\uFEFF/, '')
@@ -187,7 +192,7 @@ export function mergeState(previous: CodexJob, raw: Dict): CodexJob {
   const checkedPath = (value: string, fallback: string): string => {
     if (!value) return fallback
     const path = absolutePath(value)
-    if (!within(previous.runDir, path) || !samePath(path, fallback) || sensitivePath(path)) throw new Error('状态文件把结果指向了约定的 report.md/final.json 之外。')
+    if (!within(previous.runDir, path) || !samePath(path, fallback) || sensitivePath(path.slice(previous.runDir.length + 1))) throw new Error('状态文件把结果指向了约定的 report.md/final.json 之外。')
     return path
   }
   const progress = dict(raw.progress)
@@ -199,6 +204,13 @@ export function mergeState(previous: CodexJob, raw: Dict): CodexJob {
   const executionPath = execution.path ? absolutePath(execution.path) : previous.executionWorkspace
   if (executionPath && !samePath(executionPath, `${previous.runDir}/workspace`)) throw new Error('执行快照路径不在当前任务的 workspace 目录。')
   const stateScopes = Array.isArray(execution.scope_entries) ? execution.scope_entries.map(entry => dict(entry).path) : execution.scope_paths ?? raw.scope_paths
+  const pathList = (key: string, fallback: string[] | undefined): string[] => {
+    const value = execution[key] ?? raw[key] ?? (key === 'verification_output_paths' && Array.isArray(execution.verification_output_entries) ? execution.verification_output_entries.map(entry => dict(entry).path) : undefined)
+    return value === undefined ? fallback ?? [] : normalizeScopes(previous.workspace, value)
+  }
+  const readOnlyValue = execution.read_only_paths ?? raw.read_only_paths
+  const readOnlyCount = execution.read_only_file_count ?? raw.read_only_file_count ?? execution.read_only_paths_count ?? raw.read_only_paths_count
+  const readOnlyTruncated = execution.read_only_paths_truncated ?? raw.read_only_paths_truncated
   const artifactPath = (value: unknown, filename: string): string => {
     if (!value) return ''
     const candidate = absolutePath(value)
@@ -209,11 +221,21 @@ export function mergeState(previous: CodexJob, raw: Dict): CodexJob {
     ...previous,
     model: cleanText(raw.model || raw.selected_model || previous.model, 160),
     effort: cleanText(raw.effort || raw.selected_effort || previous.effort, 40),
+    title: cleanText(raw.title || packet.title || previous.title, 2000),
+    planTaskId: cleanText(raw.plan_task_id || packet.plan_task_id || previous.planTaskId, 160),
     goal: cleanText(raw.goal || raw.task || previous.goal, MAX_PACKET),
     reason: cleanText(raw.reason || packet.reason || previous.reason, MAX_PACKET),
-    taskPrompt: previous.taskPrompt || (Object.keys(packet).length ? cleanText(JSON.stringify(Object.fromEntries(['goal', 'reason', 'context', 'acceptance', 'tests', 'scope_paths', 'kind'].filter(key => packet[key] !== undefined).map(key => [key, packet[key]])), null, 2), MAX_PACKET) : undefined),
+    taskPrompt: previous.taskPrompt || (Object.keys(packet).length ? cleanText(JSON.stringify(Object.fromEntries(['title', 'plan_task_id', 'goal', 'reason', 'context', 'context_paths', 'dependency_paths', 'verification_output_paths', 'acceptance', 'tests', 'scope_paths', 'kind'].filter(key => packet[key] !== undefined).map(key => [key, packet[key]])), null, 2), MAX_PACKET) : undefined),
     executionWorkspace: executionPath,
+    scopeWarnings: [...new Set([...(previous.scopeWarnings ?? []), ...strings(stateScopes).filter(scope => !normalizeScopes(previous.workspace, [scope]).length).map(scope => `Excluded scope path (sensitive, invalid, or outside workspace): ${scope}`)])],
     scopePaths: stateScopes === undefined ? previous.scopePaths ?? [] : normalizeScopes(previous.workspace, stateScopes),
+    contextPaths: pathList('context_paths', previous.contextPaths),
+    dependencyPaths: pathList('dependency_paths', previous.dependencyPaths),
+    verificationOutputPaths: pathList('verification_output_paths', previous.verificationOutputPaths),
+    implicitContextPaths: pathList('implicit_context_paths', previous.implicitContextPaths),
+    readOnlyPaths: pathList('read_only_paths', previous.readOnlyPaths),
+    readOnlyPathsCount: typeof readOnlyCount === 'number' && Number.isFinite(readOnlyCount) && readOnlyCount >= 0 ? Math.floor(readOnlyCount) : Array.isArray(readOnlyValue) ? readOnlyValue.length : previous.readOnlyPathsCount,
+    readOnlyPathsTruncated: typeof readOnlyTruncated === 'boolean' ? readOnlyTruncated : Array.isArray(readOnlyValue) ? readOnlyValue.length > 200 : previous.readOnlyPathsTruncated,
     patchPath: artifactPath(artifacts.patch_path ?? artifacts.patch, 'changes.patch'),
     changesPath: artifactPath(artifacts.changes_path ?? artifacts.changes, 'changes.json'),
     reviewSourcePatchPath: artifactPath(artifacts.review_source_patch, 'review-source.patch'),
@@ -301,7 +323,7 @@ function toolSummary(job: CodexJob, extra: Dict = {}): Dict {
     raw_status: job.rawStatus,
     model: job.model,
     effort: job.effort,
-    task: job.goal,
+    task: job.goal, title: job.title || '', plan_task_id: job.planTaskId || '', scope_warnings: job.scopeWarnings || [],
     reason: job.reason,
     workspace: job.workspace,
     run_dir: job.runDir,
@@ -313,6 +335,10 @@ function toolSummary(job: CodexJob, extra: Dict = {}): Dict {
     kind: job.kind || '', review_of: job.reviewOf || '', parent_job: job.parentJob || '', author_provider: job.authorProvider || '',
     attempt: job.attempt, failure_kind: job.failureKind || '', next_action: job.nextAction || '', retryable: job.retryable,
     execution_workspace: job.executionWorkspace || '', scope_paths: job.scopePaths || [],
+    context_paths: job.contextPaths || [], dependency_paths: job.dependencyPaths || [],
+    verification_output_paths: job.verificationOutputPaths || [], implicit_context_paths: job.implicitContextPaths || [],
+    read_only_paths: job.readOnlyPaths || [], read_only_file_count: job.readOnlyPathsCount ?? job.readOnlyPaths?.length ?? 0,
+    read_only_paths_truncated: job.readOnlyPathsTruncated ?? false,
     ...(job.result ? { result: job.result } : {}),
     ...(job.readError ? { state_note: job.readError } : {}),
     ...extra,
@@ -406,12 +432,16 @@ async function delegate($: EngineInterface, input: DelegateInput): Promise<Dict>
   const reason = string(packet.reason)
   const goal = string(packet.goal)
   if (!reason || !goal) throw new Error('任务包必须含非空 goal 与 reason，说明任务和模型/effort 的选择依据。')
+  const scopePaths = normalizeScopes(workspace, packet.scope_paths)
+  const scopeWarnings = strings(packet.scope_paths).filter(scope => !normalizeScopes(workspace, [scope]).length).map(scope => `Excluded scope path (sensitive, invalid, or outside workspace): ${scope}`)
+  if (scopeWarnings.length) await $.ui.toast(scopeWarnings.join('\n'))
   const failedLaunch = async (raw: Dict): Promise<Dict> => {
     const at = new Date(await $.clock.now()).toISOString()
     const failure: CodexJob = {
       id: `launch-${Date.parse(at)}-${(await codexJobs($)).length}`, provider: 'external-codex', workspace,
       runDir: '', statePath: '', reportPath: '', resultPath: '', model, effort,
-      goal, reason, taskPrompt: cleanText(JSON.stringify(packet, null, 2), MAX_PACKET),
+      title: cleanText(packet.title, 2000), planTaskId: cleanText(packet.plan_task_id, 160),
+      goal, reason, scopePaths, scopeWarnings, taskPrompt: cleanText(JSON.stringify(packet, null, 2), MAX_PACKET),
       status: 'blocked', rawStatus: string(raw.status) || 'blocked', startedAt: at, finishedAt: at, updatedAt: at,
       summary: cleanText(raw.summary, 12_000) || '执行器未能启动 worker。', lastTool: '', lastMessage: '', changedFiles: [], readError: '', authenticationVerified: false,
       kind: cleanText(packet.kind, 80) || 'launch', reviewOf: cleanText(packet.review_of, 160), parentJob: cleanText(packet.parent_job, 160),
@@ -441,7 +471,8 @@ async function delegate($: EngineInterface, input: DelegateInput): Promise<Dict>
   const seed: CodexJob = {
     id, provider: 'external-codex', workspace, runDir, statePath,
     reportPath: `${runDir}/report.md`, resultPath: `${runDir}/final.json`,
-    goal: cleanText(goal, MAX_PACKET), reason: cleanText(reason, MAX_PACKET), taskPrompt: cleanText(JSON.stringify(packet, null, 2), MAX_PACKET), scopePaths: normalizeScopes(workspace, packet.scope_paths), model, effort,
+    title: cleanText(packet.title, 2000), planTaskId: cleanText(packet.plan_task_id, 160),
+    goal: cleanText(goal, MAX_PACKET), reason: cleanText(reason, MAX_PACKET), taskPrompt: cleanText(JSON.stringify(packet, null, 2), MAX_PACKET), scopePaths, scopeWarnings, model, effort,
     status: 'queued', rawStatus: 'queued',
     startedAt: new Date(await $.clock.now()).toISOString(), finishedAt: '', updatedAt: '',
     summary: '', lastTool: '', lastMessage: '', changedFiles: [], readError: '', authenticationVerified: false,
@@ -460,7 +491,7 @@ async function delegate($: EngineInterface, input: DelegateInput): Promise<Dict>
 export async function startCodex($: EngineInterface): Promise<void> {
   let refreshing = false
   await $.tool.register({
-    name: 'codex_delegate', isDeferred: false,
+    name: 'codex_delegate', isDeferred: true,
     description: '主会话把一个已授权的有限任务交给外部官方 Codex CLI worker，沿用 ChatGPT 登录。必须先写 JSON 任务包（goal、reason 和授权范围），明确完整 model id 与 effort。不得用 Claude Agent 工具包装。默认等待真实结果后返回；background=true 可继续独立工作，之后 codex_status(wait=true) 一次收回。与 Claude 子代理显示在同一 Agents 侧栏。不生成订阅费用估算。',
     inputSchema: {
       type: 'object', additionalProperties: false,
@@ -477,14 +508,14 @@ export async function startCodex($: EngineInterface): Promise<void> {
       required: ['workspace', 'packet_file', 'model', 'effort'],
     },
   })
-  await $.tool.register({ name: 'codex_catalog', isDeferred: false,
+  await $.tool.register({ name: 'codex_catalog', isDeferred: true,
     description: 'Read the official local Codex model catalog. refresh=true updates the CLI cache without a model completion; otherwise use the cache. Report availability honestly.',
     inputSchema: { type: 'object', additionalProperties: false, properties: { refresh: { type: 'boolean', default: false } } } })
-  await $.tool.register({ name: 'codex_cleanup', isDeferred: false,
+  await $.tool.register({ name: 'codex_cleanup', isDeferred: true,
     description: 'Clean expired terminal worker artifacts for an explicitly supplied workspace. Default is a dry run; never removes active tasks or auth/config files. This does not call a model.',
     inputSchema: { type: 'object', additionalProperties: false, properties: { workspace: { type: 'string' }, days: { type: 'integer', minimum: 1, maximum: 3650, default: 30 }, dry_run: { type: 'boolean', default: true } }, required: ['workspace'] } })
   await $.tool.register({
-    name: 'codex_status', isDeferred: false,
+    name: 'codex_status', isDeferred: true,
     description: '读取本会话已跟踪 Codex worker 的真实状态与结果，不重交任务。wait=true 在本次工具调用内等到终态或超时；无需频繁向模型发状态查询。只能查询已跟踪 job_id/run_dir。',
     inputSchema: {
       type: 'object', additionalProperties: false,
@@ -513,28 +544,28 @@ export const registerCodex: Register = (on, options) => {
   })
   on('tool.call', { tool: CODEX_DELEGATE }, async ($, e) => {
     const refusal = await recursionBlocked($, e.agentId)
-    if (refusal) return { result: { provider: 'external Codex worker', status: 'blocked', summary: refusal } }
-    if (!await workflowAllowed($)) return { result: { provider: 'external Codex worker', status: 'blocked', summary: await workflowRefusal($) } }
-    try { return { result: await delegate($, e as unknown as DelegateInput) } }
-    catch (error) { return { result: { provider: 'external Codex worker', status: 'blocked', summary: cleanText(error instanceof Error ? error.message : String(error), 1200) } } }
+    if (refusal) return answer({ provider: 'external Codex worker', status: 'blocked', summary: refusal })
+    if (!await workflowAllowed($)) return answer({ provider: 'external Codex worker', status: 'blocked', summary: await workflowRefusal($) })
+    try { return answer(await delegate($, e as unknown as DelegateInput)) }
+    catch (error) { return answer({ provider: 'external Codex worker', status: 'blocked', summary: cleanText(error instanceof Error ? error.message : String(error), 1200) }) }
   })
   on('tool.call', { tool: CODEX_CATALOG }, async ($, event) => {
-    if (event.agentId) return { result: { status: 'blocked', summary: 'Only the main session may inspect the catalog.' } }
+    if (event.agentId) return answer({ status: 'blocked', summary: 'Only the main session may inspect the catalog.' })
     try {
       const refresh = (event as unknown as { refresh?: unknown }).refresh === true
-      return { result: parseProcess(await $.process.run([...await workerCommand($), 'catalog', refresh ? '--refresh' : '--cached'], { timeoutMs: 30_000 })) }
-    } catch (error) { return { result: { status: 'unavailable', summary: cleanText(String(error), 1200) } } }
+      return answer(parseProcess(await $.process.run([...await workerCommand($), 'catalog', refresh ? '--refresh' : '--cached'], { timeoutMs: 30_000 })))
+    } catch (error) { return answer({ status: 'unavailable', summary: cleanText(String(error), 1200) }) }
   })
   on('tool.call', { tool: CODEX_CLEANUP }, async ($, event) => {
-    if (event.agentId) return { result: { status: 'blocked', summary: 'Only the main session may clean worker files.' } }
+    if (event.agentId) return answer({ status: 'blocked', summary: 'Only the main session may clean worker files.' })
     try {
       const input = event as unknown as { workspace: unknown; days?: unknown; dry_run?: unknown }
       const workspace = absolutePath(input.workspace)
       const configured = Number(workerOptions.retentionDays)
       const days = input.days ?? (Number.isInteger(configured) && configured >= 1 && configured <= 3650 ? configured : 30)
       if (!Number.isInteger(days) || Number(days) < 1 || Number(days) > 3650 || (input.dry_run !== undefined && typeof input.dry_run !== 'boolean')) throw new Error('Invalid retention arguments.')
-      return { result: parseProcess(await $.process.run([...await workerCommand($), 'cleanup', '--workspace', workspace, '--days', String(days), ...(input.dry_run === false ? [] : ['--dry-run'])], { cwd: workspace, timeoutMs: 30_000 })) }
-    } catch (error) { return { result: { status: 'blocked', summary: cleanText(String(error), 1200) } } }
+      return answer(parseProcess(await $.process.run([...await workerCommand($), 'cleanup', '--workspace', workspace, '--days', String(days), ...(input.dry_run === false ? [] : ['--dry-run'])], { cwd: workspace, timeoutMs: 30_000 })))
+    } catch (error) { return answer({ status: 'blocked', summary: cleanText(String(error), 1200) }) }
   })
   on('tool.call', { tool: CODEX_STATUS }, async ($, e) => {
     try {
@@ -545,14 +576,14 @@ export const registerCodex: Register = (on, options) => {
       if (!id && !runDir) {
         if (input.wait) throw new Error('等待结果时必须指定已跟踪的 job_id 或 run_dir。')
         await refreshCodex($, true)
-        return { result: { jobs: (await codexJobs($)).map(job => toolSummary(job)) } }
+        return answer({ jobs: (await codexJobs($)).map(job => toolSummary(job)) })
       }
       const job = list.find(value => (!id || value.id === id) && (!runDir || samePath(value.runDir, runDir)))
       if (!job) throw new Error('该任务未由本会话跟踪；不能读取任意任务目录。')
       const refreshed = await refreshJob($, job)
-      return { result: input.wait === true ? await awaitJob($, refreshed, timeoutOf(input.timeout)) : await diagnoseJob($, refreshed) }
+      return answer(input.wait === true ? await awaitJob($, refreshed, timeoutOf(input.timeout)) : await diagnoseJob($, refreshed))
     } catch (error) {
-      return { result: { status: 'blocked', summary: cleanText(error instanceof Error ? error.message : String(error), 1200) } }
+      return answer({ status: 'blocked', summary: cleanText(error instanceof Error ? error.message : String(error), 1200) })
     }
   })
 }
@@ -562,7 +593,7 @@ export function previewFiles(job: CodexJob): { path: string; label: string; root
   for (const [label, candidate, expected] of [['报告', job.reportPath, `${job.runDir}/report.md`], ['结果 JSON', job.resultPath, `${job.runDir}/final.json`]]) {
     try {
       const path = absolutePath(candidate)
-      if (within(job.runDir, path) && samePath(path, expected) && !sensitivePath(path)) files.push({ path, label, root: job.runDir })
+      if (within(job.runDir, path) && samePath(path, expected) && !sensitivePath(path.slice(job.runDir.length + 1))) files.push({ path, label, root: job.runDir })
     } catch { /* A malformed artifact grants no access. */ }
   }
   for (const [label, candidate, name] of [['补丁', job.patchPath, 'changes.patch'], ['变更清单', job.changesPath, 'changes.json'], ['复核证据补丁', job.reviewSourcePatchPath, 'review-source.patch']]) {
@@ -571,16 +602,16 @@ export function previewFiles(job: CodexJob): { path: string; label: string; root
   }
   // New writable runs are isolated. Never accidentally preview the source file
   // as though it were the worker's modified snapshot.
-  const executionRoot = job.executionWorkspace || job.workspace
-  if (job.executionWorkspace && !samePath(executionRoot, `${job.runDir}/workspace`)) return files
+  const executionRoot = job.executionWorkspace
+  if (!executionRoot || !samePath(executionRoot, `${job.runDir}/workspace`)) return files
   for (const candidate of job.changedFiles) {
     try {
       const path = absolutePath(/^(?:[A-Za-z]:[\\/]|\/)/.test(candidate) ? candidate : `${executionRoot}/${candidate}`)
-      const inScope = !job.executionWorkspace || (job.scopePaths ?? []).some(scope => {
+      const inScope = (job.scopePaths ?? []).some(scope => {
         const scopePath = absolutePath(`${executionRoot}/${scope}`)
         return within(executionRoot, scopePath) && within(scopePath, path)
       })
-      if (inScope && within(executionRoot, path) && !sensitivePath(path) && !files.some(file => samePath(file.path, path))) files.push({ path, label: candidate, root: executionRoot })
+      if (inScope && within(executionRoot, path) && !sensitivePath(path.slice(executionRoot.length + 1)) && !files.some(file => samePath(file.path, path))) files.push({ path, label: candidate, root: executionRoot })
     } catch { /* Reject traversal, URL, ADS and credential paths. */ }
   }
   return files.slice(0, 202)
@@ -651,6 +682,13 @@ export async function renderCodex($: EngineInterface, event: Parameters<EngineIn
       <Text bold>Codex · {STATUS_LABEL[current.status]} · {current.id}</Text>
       <Text>{current.model} · effort {current.effort} · {elapsed(current, now)}{current.tokens !== undefined ? ` · ${current.tokens.toLocaleString()} tokens` : ''}</Text>
       <Text>选择依据：{current.reason || '未知：任务未提供选择依据。'}</Text>
+      {current.scopeWarnings?.map((warning, index) => <Text key={`scope-warning-${index}`}>{warning}</Text>)}
+      <Text>可写范围：{current.scopePaths?.join(', ') || '无'}</Text>
+      <Text>只读上下文：{current.contextPaths?.join(', ') || '无'}</Text>
+      <Text>只读依赖：{current.dependencyPaths?.join(', ') || '无'}</Text>
+      <Text>验证输出：{current.verificationOutputPaths?.join(', ') || '无'}</Text>
+      <Text>自动纳入上下文：{current.implicitContextPaths?.join(', ') || '无'}</Text>
+      <Text>只读文件共 {current.readOnlyPathsCount ?? current.readOnlyPaths?.length ?? 0} 项{current.readOnlyPathsTruncated ? '（以下为样本）' : ''}：{current.readOnlyPaths?.join(', ') || '无'}</Text>
       <Text>kind: {current.kind || '未知'} · review_of: {current.reviewOf || '无'} · author_provider: {current.authorProvider || '未知'} · attempt: {current.attempt ?? '未知'}</Text>
       {current.parentJob && <Text>parent_job: {current.parentJob}</Text>}
       {current.reviewSourceJob && <Text>复核候选任务：{current.reviewSourceJob}</Text>}

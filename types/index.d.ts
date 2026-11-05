@@ -1,6 +1,8 @@
 export type Phase = 'plan' | 'design' | 'delegate' | 'review' | 'close'
 
 export type PlannedTask = {
+  id?: string
+  jobId?: string
   title: string
   tier: string
   after: number[]
@@ -96,6 +98,9 @@ export type CodexResult = {
 }
 
 export type CodexJob = {
+  title?: string
+  planTaskId?: string
+  scopeWarnings?: string[]
   id: string
   provider: 'external-codex'
   workspace: string
@@ -123,6 +128,13 @@ export type CodexJob = {
   taskPrompt?: string
   executionWorkspace?: string
   scopePaths?: string[]
+  contextPaths?: string[]
+  dependencyPaths?: string[]
+  verificationOutputPaths?: string[]
+  implicitContextPaths?: string[]
+  readOnlyPaths?: string[]
+  readOnlyPathsCount?: number
+  readOnlyPathsTruncated?: boolean
   patchPath?: string
   changesPath?: string
   reviewSourcePatchPath?: string

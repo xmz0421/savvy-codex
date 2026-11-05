@@ -6,6 +6,7 @@ sandbox is responsible for denying writes outside the execution workspace.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -17,10 +18,8 @@ NOTICE = ("Only authorized ordinary files are staged in this snapshot. Scope is 
           "checked again against actual changes before patch export. This is not "
           "per-file OS isolation: access to system files and paths outside the "
           "snapshot depends on the host Codex sandbox. No patch is applied to the source workspace.")
-DENIED_PARTS = {".git", ".ssh", ".aws", ".azure", ".gnupg", ".codex", ".claude", ".agents", ".docker", ".kube",
-                "node_modules", "__pycache__", ".venv", "venv", "codex-worker-runs"}
-DENIED_NAMES = {"auth.json", "credentials", "credentials.json", "credentials.ini", ".npmrc", ".pypirc",
-                "id_rsa", "id_ed25519", "id_ecdsa", "token", "token.json", "secrets.json", "secrets.yaml", "secrets.yml"}
+POLICY = json.loads((Path(__file__).resolve().parents[3] / "shared" / "path-policy.json").read_text(encoding="utf-8"))
+DEPENDENCY_NAMES = set(POLICY["dependency_directory_names"])
 
 
 class SnapshotError(Exception):
@@ -35,9 +34,14 @@ def is_link(path):
 
 def sensitive(relative):
     parts = [part.casefold() for part in Path(relative).parts]
-    name = parts[-1] if parts else ""
-    return (any(part in DENIED_PARTS for part in parts) or name in DENIED_NAMES
-            or name.startswith(".env") or name.endswith((".pem", ".p12", ".pfx", ".key")))
+    return any(part in POLICY["denied_path_parts"] or part in POLICY["denied_exact_names"]
+               or any(part.startswith(prefix) for prefix in POLICY["denied_name_prefixes"])
+               or any(part.endswith(extension) for extension in POLICY["denied_extensions"])
+               for part in parts)
+
+
+def dependency_path(relative):
+    return any(part.casefold() in DEPENDENCY_NAMES for part in Path(relative).parts)
 
 
 def contains(path, root):
@@ -103,7 +107,7 @@ def git_command(workspace, git_dir, *args):
     return result.stdout
 
 
-def prepare(source, scopes, run_dir, raw_scopes=(), evidence_files=None):
+def prepare(source, scopes, run_dir, raw_scopes=(), evidence_files=None, context_paths=(), dependency_paths=(), verification_output_paths=()):
     workspace = run_dir / "workspace"
     workspace.mkdir(exist_ok=False)
     entries, omitted = [], []
@@ -116,7 +120,7 @@ def prepare(source, scopes, run_dir, raw_scopes=(), evidence_files=None):
         if str(relative) == ".":
             raise SnapshotError("Root scope '.' is not allowed; list the authorized files or subdirectories explicitly.")
         ordinary_path(scope, source)
-        if sensitive(relative):
+        if sensitive(relative) or dependency_path(relative):
             raise SnapshotError(f"Sensitive or runtime scope cannot be staged: {relative.as_posix()}")
         if contains(scope, run_dir) or contains(run_dir, scope):
             raise SnapshotError("Runtime job storage cannot be included in an authorized scope.")
@@ -128,7 +132,7 @@ def prepare(source, scopes, run_dir, raw_scopes=(), evidence_files=None):
         def stage(item):
             rel = item.relative_to(source)
             ordinary_path(item, source)
-            if sensitive(rel) or contains(item, run_dir):
+            if sensitive(rel) or dependency_path(rel) or contains(item, run_dir):
                 omitted.append(rel.as_posix())
                 return
             target = workspace / rel
@@ -143,6 +147,73 @@ def prepare(source, scopes, run_dir, raw_scopes=(), evidence_files=None):
                 raise SnapshotError(f"Only ordinary files can be staged: {rel.as_posix()}")
         if scope.exists():
             stage(scope)
+    readonly = set()
+    dependency_stats = {"files": 0, "bytes": 0, "strategy": "ordinary-file-copy; links rejected"}
+    implicit = set()
+    for entry in entries:
+        parent = Path(entry["path"]) if entry["type"] == "directory" else Path(entry["path"]).parent
+        while True:
+            for name in ("AGENTS.md", "CLAUDE.md"):
+                rel = parent / name
+                if (source / rel).is_file() and not any(entry["type"] == "file" and entry["path"] == rel.as_posix() for entry in entries):
+                    implicit.add(rel.as_posix())
+            if parent == Path("."):
+                break
+            parent = parent.parent
+    # Directory authorization never implicitly authorizes rewriting project
+    # instructions already copied within that directory.
+    for rel in inventory(workspace)[0]:
+        if Path(rel).name in {"AGENTS.md", "CLAUDE.md"} and not any(entry["type"] == "file" and entry["path"] == rel for entry in entries):
+            implicit.add(rel)
+
+    def stage_readonly(item, dependency=False):
+        ordinary_path(item, source)
+        rel = item.relative_to(source)
+        if sensitive(rel) or contains(item, run_dir):
+            raise SnapshotError("Sensitive context/dependency input cannot be staged: " + rel.as_posix())
+        if dependency_path(rel) and not dependency:
+            raise SnapshotError("Dependency directories require explicit dependency_paths: " + rel.as_posix())
+        if item.is_dir():
+            (workspace / rel).mkdir(parents=True, exist_ok=True)
+            for child in sorted(item.iterdir()):
+                stage_readonly(child, dependency)
+        elif item.is_file():
+            target = workspace / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target, follow_symlinks=False)
+            readonly.add(rel.as_posix())
+            if dependency:
+                dependency_stats["files"] += 1
+                dependency_stats["bytes"] += item.stat().st_size
+        else:
+            raise SnapshotError("Missing or nonordinary read-only input: " + rel.as_posix())
+
+    readonly_entries = []
+    for value in list(context_paths) + list(dependency_paths):
+        rel = Path(value)
+        item = source / rel
+        ordinary_path(item, source)
+        if item == source:
+            raise SnapshotError("Root read-only input is not allowed; list explicit project inputs.")
+        descriptor = {"path": rel.as_posix(), "type": "directory" if item.is_dir() else "file"}
+        if any(authorized(rel, [entry]) or authorized(entry["path"], [descriptor]) for entry in entries):
+            raise SnapshotError("Explicit read-only inputs must not overlap write scope: " + str(value))
+        readonly_entries.append(descriptor)
+    for value in list(context_paths) + sorted(implicit):
+        stage_readonly(source / value)
+    for value in dependency_paths:
+        stage_readonly(source / value, True)
+    output_entries = []
+    for value in verification_output_paths:
+        rel = Path(value)
+        target = source / rel
+        ordinary_path(target, source)
+        output = {"path": rel.as_posix(), "type": "directory" if str(value).endswith(("/", "\\")) else "file"}
+        if sensitive(rel) or target.exists() or any(authorized(key, [output]) for key in readonly):
+            raise SnapshotError("Verification outputs must be new nonsensitive paths separate from read-only inputs: " + str(value))
+        if any(authorized(rel, [entry]) or contains(Path(entry["path"]), rel) for entry in entries):
+            raise SnapshotError("Verification outputs must be separate from write scope: " + str(value))
+        output_entries.append(output)
     evidence_paths = []
     for relative, original in (evidence_files or {}).items():
         target = workspace / relative
@@ -164,7 +235,11 @@ def prepare(source, scopes, run_dir, raw_scopes=(), evidence_files=None):
             "scope_paths": [entry["path"] for entry in entries], "scope_entries": entries,
             "omitted_paths": omitted, "notice": NOTICE, "baseline": baseline, "baseline_commit": commit,
             "baseline_directories": directory_inventory(workspace), "git_dir": str(git_dir),
-            "read_only_evidence_paths": evidence_paths}
+            "read_only_evidence_paths": evidence_paths, "read_only_paths": sorted(readonly | set(evidence_paths)),
+            "context_paths": list(context_paths), "implicit_context_paths": sorted(implicit),
+            "dependency_paths": list(dependency_paths), "dependency_copy": dependency_stats,
+            "read_only_entries": readonly_entries,
+            "verification_output_entries": output_entries}
 
 
 def authorized(relative, entries):
@@ -177,8 +252,9 @@ def inspect_changes(snapshot):
     current, hazards = inventory(Path(snapshot["path"]))
     baseline = snapshot["baseline"]
     changed = sorted(key for key in set(baseline) | set(current) if baseline.get(key) != current.get(key))
-    entries = snapshot["scope_entries"]
-    rejected = sorted(set(hazards) | {key for key in changed if not authorized(key, entries) or sensitive(key)})
+    entries = snapshot["scope_entries"] + snapshot.get("verification_output_entries", [])
+    readonly = set(snapshot.get("read_only_paths", []))
+    rejected = sorted(set(hazards) | {key for key in changed if key in readonly or authorized(key, snapshot.get("read_only_entries", [])) or not authorized(key, entries) or sensitive(key)})
     directory_delta = set(snapshot["baseline_directories"]) ^ set(directory_inventory(Path(snapshot["path"])))
     for key in directory_delta:
         scaffold = any(contains(Path(entry["path"]), Path(key)) for entry in entries)
@@ -186,7 +262,7 @@ def inspect_changes(snapshot):
             rejected.append(key + "/")
     changes = [{"path": key, "change": "added" if key not in baseline else "deleted" if key not in current else "modified",
                 "sha256_before": baseline.get(key), "sha256_after": current.get(key)}
-               for key in changed]
+               for key in changed if not authorized(key, snapshot.get("verification_output_entries", []))]
     return changes, sorted(set(rejected))
 
 

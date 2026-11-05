@@ -370,6 +370,174 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue(self.destination.exists())
         self.assertEqual(list(outside.iterdir()), [])
 
+    def assert_live_snapshot(self, expected):
+        actual = {key: value for key, value in self.snapshot().items()
+                  if not key.startswith("backups/") and not key.startswith("backups\\")}
+        self.assertEqual(actual, expected)
+
+    def live_snapshot(self):
+        return {key: value for key, value in self.snapshot().items()
+                if not key.startswith("backups/") and not key.startswith("backups\\")}
+
+    def test_failed_staged_move_restores_original_package_and_settings(self):
+        self.run_install()
+        before = self.live_snapshot()
+        (self.source / "hooks" / "sample.txt").write_text("new version")
+        with mock.patch.object(INSTALLER.shutil, "move", side_effect=OSError("injected move failure")):
+            with self.assertRaisesRegex(OSError, "injected move"):
+                self.run_install()
+        self.assert_live_snapshot(before)
+        self.assertEqual(list(self.destination.parent.glob(".savvy-codex-rollback-*")), [])
+        backups = list((self.home / "backups" / "savvy-codex").glob("*/" + INSTALLER.BACKUP_MARKER))
+        self.assertTrue(any(not json.loads(path.read_text())["successful"] for path in backups))
+
+    def test_partial_move_failure_removes_partial_package_before_restoration(self):
+        self.run_install()
+        before = self.live_snapshot()
+        (self.source / "hooks" / "sample.txt").write_text("new version")
+        def partial_move(source, destination):
+            Path(destination).mkdir()
+            (Path(destination) / "partial.txt").write_text("partial")
+            raise OSError("injected partial move")
+        with mock.patch.object(INSTALLER.shutil, "move", side_effect=partial_move):
+            with self.assertRaisesRegex(OSError, "partial move"):
+                self.run_install()
+        self.assert_live_snapshot(before)
+
+    def test_each_configuration_commit_failure_rolls_back_package_and_exact_files(self):
+        for target in ("settings.json", "CLAUDE.md", INSTALLER.RECEIPT_NAME):
+            with self.subTest(target=target):
+                self.write_settings({"model": "keep", "enabledPlugins": {"other": True}})
+                (self.home / "CLAUDE.md").write_text("before" + INSTALLER.START + "old" + INSTALLER.END + "after")
+                before = self.live_snapshot()
+                original = INSTALLER.atomic_write
+                failed = False
+                def fail_once(path, data):
+                    nonlocal failed
+                    if path == self.home / target and not failed:
+                        failed = True
+                        raise OSError("injected config failure")
+                    return original(path, data)
+                with mock.patch.object(INSTALLER, "atomic_write", side_effect=fail_once):
+                    with self.assertRaisesRegex(OSError, "config failure"):
+                        self.run_install()
+                self.assertTrue(failed)
+                self.assert_live_snapshot(before)
+
+    def test_uninstall_failure_restores_package_and_receipt(self):
+        self.run_install()
+        before = self.live_snapshot()
+        original = INSTALLER.atomic_write
+        failed = False
+        def fail_once(path, data):
+            nonlocal failed
+            if path == self.home / INSTALLER.RECEIPT_NAME and not failed:
+                failed = True
+                raise OSError("injected uninstall failure")
+            return original(path, data)
+        with mock.patch.object(INSTALLER, "atomic_write", side_effect=fail_once):
+            with self.assertRaisesRegex(OSError, "uninstall failure"):
+                INSTALLER.uninstall(self.home)
+        self.assert_live_snapshot(before)
+
+    def test_failed_rollback_keeps_recovery_backup_and_original_package(self):
+        self.run_install()
+        old_package = INSTALLER.file_hashes(self.destination)
+        self.write_settings({"enabledPlugins": {"other": True}})
+        original_settings = (self.home / "settings.json").read_bytes()
+        (self.source / "hooks" / "sample.txt").write_text("upgrade")
+        original = INSTALLER.atomic_write
+        def persistent_failure(path, data):
+            if path == self.home / "settings.json":
+                raise OSError("settings locked")
+            return original(path, data)
+        with mock.patch.object(INSTALLER, "atomic_write", side_effect=persistent_failure):
+            with self.assertRaisesRegex(OSError, "preserved backup/sibling"):
+                self.run_install()
+        self.assertEqual(INSTALLER.file_hashes(self.destination), old_package)
+        failed = [entry for entry in (self.home / "backups" / "savvy-codex").iterdir()
+                  if not json.loads((entry / INSTALLER.BACKUP_MARKER).read_text())["successful"]]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual((failed[0] / "settings.json").read_bytes(), original_settings)
+        INSTALLER.prune_backups(self.home, 0)
+        self.assertTrue(failed[0].exists())
+
+    def test_retention_only_prunes_successful_identified_backups(self):
+        self.run_install()
+        root = self.home / "backups" / "savvy-codex"
+        unknown = root / "unknown"
+        unknown.mkdir()
+        (unknown / "keep.txt").write_text("user backup")
+        INSTALLER.backup_metadata(unknown, self.home, successful=True)
+        failed = root / "failed"
+        failed.mkdir()
+        INSTALLER.backup_metadata(failed, self.home, successful=False)
+        wrong_path = root / "wrong-path"
+        wrong_path.mkdir()
+        INSTALLER.backup_metadata(wrong_path, self.home, successful=True)
+        marker = json.loads((wrong_path / INSTALLER.BACKUP_MARKER).read_text())
+        marker["backup_path"] = str(root / "other")
+        (wrong_path / INSTALLER.BACKUP_MARKER).write_text(json.dumps(marker))
+        for index in range(7):
+            (self.source / "hooks" / "sample.txt").write_text(str(index))
+            self.run_install()
+        managed = [path for path in root.iterdir() if path not in (unknown, failed, wrong_path)]
+        self.assertEqual(len(managed), 5)
+        self.assertTrue((unknown / "keep.txt").exists())
+        self.assertTrue(failed.exists())
+        self.assertTrue(wrong_path.exists())
+
+    def test_invalid_retention_fails_before_any_mutation(self):
+        before = self.snapshot()
+        with self.assertRaises(ValueError):
+            INSTALLER.install(self.source, self.home, skip_doctor=True, keep_backups=-1)
+        self.assertEqual(before, self.snapshot())
+
+    def test_postcommit_old_package_cleanup_failure_returns_success_with_recovery_path(self):
+        self.run_install()
+        (self.source / "hooks/sample.txt").write_text("committed upgrade")
+        original = INSTALLER.shutil.rmtree
+        def locked_old_package(path, *args, **kwargs):
+            if Path(path).name.startswith(".savvy-codex-rollback-"):
+                raise PermissionError("injected cleanup lock")
+            return original(path, *args, **kwargs)
+        with mock.patch.object(INSTALLER.shutil, "rmtree", side_effect=locked_old_package):
+            result = self.run_install()
+        self.assertTrue(result["changed"])
+        self.assertEqual((self.destination / "hooks/sample.txt").read_text(), "committed upgrade")
+        self.assertEqual(json.loads((self.home / INSTALLER.RECEIPT_NAME).read_text())["status"], "installed")
+        leftovers = list(self.destination.parent.glob(".savvy-codex-rollback-*"))
+        self.assertEqual(len(leftovers), 1)
+        self.assertTrue(any(str(leftovers[0]) in warning for warning in result["warnings"]))
+
+    def test_postcommit_backup_marker_failure_returns_success_and_skips_retention(self):
+        self.run_install()
+        (self.source / "hooks/sample.txt").write_text("committed marker failure")
+        original = INSTALLER.backup_metadata
+        def fail_completion(backup, home, *, successful):
+            if successful:
+                raise OSError("injected marker failure")
+            return original(backup, home, successful=successful)
+        with mock.patch.object(INSTALLER, "backup_metadata", side_effect=fail_completion), \
+             mock.patch.object(INSTALLER, "prune_backups") as prune:
+            result = self.run_install()
+        prune.assert_not_called()
+        self.assertEqual((self.destination / "hooks/sample.txt").read_text(), "committed marker failure")
+        backup = Path(result["backup"])
+        self.assertTrue(backup.exists())
+        self.assertFalse(json.loads((backup / INSTALLER.BACKUP_MARKER).read_text())["successful"])
+        self.assertTrue(any("Changes committed" in warning and "marker" in warning for warning in result["warnings"]))
+
+    def test_postcommit_retention_failure_preserves_uninstall_success(self):
+        self.run_install()
+        with mock.patch.object(INSTALLER, "prune_backups", side_effect=PermissionError("injected prune lock")):
+            result = INSTALLER.uninstall(self.home)
+        self.assertEqual(result["status"], "uninstalled")
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(json.loads((self.home / INSTALLER.RECEIPT_NAME).read_text())["status"], "uninstalled")
+        self.assertTrue((Path(result["backup"]) / "savvy-codex").exists())
+        self.assertTrue(any("Changes committed" in warning and "retention" in warning for warning in result["warnings"]))
+
 
 if __name__ == "__main__":
     unittest.main()

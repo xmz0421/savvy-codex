@@ -26,7 +26,7 @@ const STEP_BRIEF = `
 Progress reporting: before any other work, call \`${STEP_TOOL}\` with \`total\` (your plan in 3-8 steps) and \`done: 0\`; call it again with \`done\` and a few-word \`note\` as each step finishes. It only draws a progress bar.`
 const PANE = 'savvy-agents'
 const PHASES: readonly Phase[] = ['plan', 'design', 'delegate', 'review', 'close']
-const TIERS: readonly string[] = ['fable', 'heavy', 'careful', 'medium', 'light']
+const TIERS: readonly string[] = ['fable', 'heavy', 'careful', 'medium', 'light', 'review']
 // The tools' schemas are advice to the model, not a check: what a call may ask
 // the band and the panel to draw is bounded here.
 const MAX_TASKS = 200
@@ -43,7 +43,7 @@ type ProgressInput = {
   done?: number
   phase?: Phase
   finished?: boolean
-  tasks?: { title?: string; tier?: string; after?: number[]; provider?: string; model?: string; effort?: string }[]
+  tasks?: { id?: string; job_id?: string; title?: string; tier?: string; after?: number[]; provider?: string; model?: string; effort?: string }[]
 }
 
 // ---------------------------------------------------------------------------
@@ -166,7 +166,7 @@ const tr = () => STRINGS[lang]
 const isRtl = () => lang === 'he'
 
 // Tier and effort words as shown; anything unknown shows as it came.
-const tierWord = (tier: string): string => (tr().tier as Record<string, string>)[tier] ?? tier
+const tierWord = (tier: string): string => tier === 'review' ? tr().review : (tr().tier as Record<string, string>)[tier] ?? tier
 const effortWord = (effort: string): string => (tr().effort as Record<string, string>)[effort] ?? effort
 
 const isRussian = (v: unknown): boolean => typeof v === 'string' && /^(ru|russian|рус)/i.test(v.trim())
@@ -210,6 +210,7 @@ const cleanTasks = (tasks: ProgressInput['tasks']): PlannedTask[] | undefined =>
     ?.filter(t => t.title?.trim())
     .slice(0, MAX_TASKS)
     .map(t => ({
+      id: cleanText(t.id, 160), jobId: cleanText(t.job_id, 160),
       title: (t.title ?? '').trim(),
       tier: t.provider === 'codex' ? '' : tierName(t.tier ?? ''),
       after: (t.after ?? []).filter(n => Number.isInteger(n) && n > 0).slice(0, MAX_AFTER),
@@ -376,6 +377,7 @@ const barText = (f: Flow, width: number): string => {
 // Agents panel: every subagent of the session, plus the tasks the flow planned.
 
 const TIER_COLOR: Record<string, string> = {
+  review: '#6c8c79',
   fable: '#7F77DD',
   heavy: '#D85A30',
   careful: '#BA7517',
@@ -457,8 +459,9 @@ const costOf = (model: string, u: Usage, isRequest: boolean): number => {
   )
 }
 
-// Haiku 4.5 and the Claude 3 models have a 200K window; the rest, Haiku 5.5 included, 1M.
-const windowOf = (model: string): number => (/haiku-4|claude-3/i.test(model) ? 200_000 : 1_000_000)
+// Only an explicit host/model window marker is authoritative. Model family
+// alone cannot distinguish default windows from account-specific long context.
+const windowOf = (model: string): number => /\[1m\]/i.test(model) ? 1_000_000 : /\[200k\]/i.test(model) ? 200_000 : 0
 
 // `savvy-careful`, or `savvy-codex:savvy-careful` when the agents ship in a plugin.
 const tierOf = (type: string): string => {
@@ -496,8 +499,9 @@ type Planned = PlannedTask & { n: number }
 
 const plannedOf = (f: Flow | null, list: AgentRun[], external: CodexJob[] = []): Planned[] => {
   if (!f || f.isFinished) return []
-  const started = new Set([...list.map(a => norm(a.description)), ...external.map(job => norm(job.goal))])
-  return (f.tasks ?? []).map((t, i) => ({ ...t, n: i + 1 })).filter(t => !started.has(norm(t.title)))
+  const native = new Set(list.map(a => norm(a.description)))
+  return (f.tasks ?? []).map((t, i) => ({ ...t, n: i + 1 })).filter(t => !native.has(norm(t.title)) && !external.some(job =>
+    (t.jobId && t.jobId === job.id) || (t.id && t.id === job.planTaskId) || (job.title && norm(t.title) === norm(job.title)) || norm(t.title) === norm(job.goal)))
 }
 
 const totals = (list: AgentRun[], at: number) => {
@@ -712,7 +716,7 @@ const agentSvg = (W: number, a: AgentRun, at: number): string => {
   if (a.status === 'failed') meta.push(s.failed)
   const barW = textW
   const progress = progressOf(a)
-  const stats = `${s.ctx} ${ctx}% · ${fmtTokens(a.contextTokens)}${costText(a)}  ${fmtTime(elapsed(a, at))}`
+  const stats = `${s.ctx} ${a.contextMax ? `${ctx}%` : '未知'} · ${fmtTokens(a.contextTokens)}${costText(a)}  ${fmtTime(elapsed(a, at))}`
   const steps = a.stepTotal ? `${a.stepDone ?? 0}/${a.stepTotal}${a.stepNote ? ' · ' + a.stepNote : ''}` : ''
   const stepsW = Math.max(0, barW - textWidth(stats, 11) - 12)
   // Without reported steps the bar falls back to the context, drawn grey.
@@ -810,6 +814,7 @@ export const register: Register = (on, options) => {
     showPrices = options.priceEstimates === 'on'
     await $.tool.register({
       name: 'progress',
+      isDeferred: true,
       description:
         'Report /savvy-codex progress to the progress bar above the prompt and the agents panel. ' +
         'Call it after presenting the plan (title, total, tasks, phase "delegate"), each time a task is accepted (done), ' +
@@ -830,6 +835,7 @@ export const register: Register = (on, options) => {
             items: {
               type: 'object',
               properties: {
+                id: { type: 'string' }, job_id: { type: 'string' },
                 title: { type: 'string', description: 'A few words; reused verbatim as the Agent description.' },
                 tier: { type: 'string', enum: [...TIERS] },
                 provider: { type: 'string', enum: ['claude', 'codex'], description: 'Codex 计划项必须用 codex，不映射到 Claude tier。' },
@@ -934,9 +940,9 @@ export const register: Register = (on, options) => {
     const tool = cleanText(e.tool, 160)
     const at = await $.clock.now()
     const tracked = (await read($, agents)).find(a => a.agentId === agentId)
-    if (tracked?.kind?.toLowerCase() === 'review' && !REVIEW_READ_TOOLS.has(tool)) {
+    if (['review', 'inspect'].includes(tracked?.kind?.toLowerCase() ?? '') && !REVIEW_READ_TOOLS.has(tool)) {
       await update($, agents, list => list.map(a => a.agentId === agentId ? { ...a, activities: [...(a.activities ?? []), { tool, status: 'blocked: read-only review', at }].slice(-80) } : a))
-      return { result: { status: 'blocked', summary: 'Review agents are read-only. Use Read/Grep/Glob and existing validation output; return new execution needs to the lead.' } }
+      return { deny: 'Review agents are read-only. Use Read/Grep/Glob and existing validation output; return new execution needs to the lead.' }
     }
     const marker = { tool, status: 'running', at }
     await update($, agents, list => list.map(a => a.agentId === agentId ? { ...a, activities: [...(a.activities ?? []), marker].slice(-80) } : a))
@@ -946,7 +952,7 @@ export const register: Register = (on, options) => {
     catch (error) { failed = true; throw error }
     finally {
       const raw = result && typeof result === 'object' ? result as Record<string, unknown> : {}
-      failed ||= raw.isError === true || raw.error !== undefined || (raw.result && typeof raw.result === 'object' && (raw.result as Record<string, unknown>).status === 'blocked') === true
+      failed ||= raw.deny !== undefined || raw.isError === true || raw.error !== undefined
       const input = e as unknown as Record<string, unknown>
       const candidate = input.file_path ?? input.path
       await update($, agents, list => list.map(a => {
@@ -967,17 +973,21 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
     const type = String(e.subagent_type ?? '')
     if (!savvyWorker(type)) return next(e)
-    if (!await workflowAllowed($)) return { result: { status: 'blocked', summary: await workflowRefusal($) } }
-
-    await update($, flow, prev => {
-      const base = prev && !prev.isFinished ? { ...blank(), ...prev } : blank()
-      return { ...base, running: base.running + 1, phase: base.phase === 'plan' ? 'delegate' : base.phase }
-    })
-    try {
-      return await next(e)
-    } finally {
-      await update($, flow, prev => (prev ? { ...prev, running: Math.max(0, prev.running - 1) } : prev))
+    if (!await workflowAllowed($)) return { deny: await workflowRefusal($) }
+    const input = e as unknown as { isolation?: string; prompt?: string }
+    // Worktree is an explicit per-call choice. Check its real prerequisites;
+    // never silently erase uncommitted input by launching from HEAD.
+    if (input.isolation === 'worktree') {
+      try {
+        const cwd = await $.session.cwd()
+        const head = await $.process.run(['git', 'rev-parse', '--verify', 'HEAD'], { cwd, timeoutMs: 10_000 })
+        if (head.exitCode !== 0) return { deny: 'Worktree requires a Git repository with an existing commit. Use a shared read-only reviewer or let the lead handle this project directly.' }
+        const dirty = await $.process.run(['git', 'status', '--porcelain'], { cwd, timeoutMs: 10_000 })
+        if (dirty.exitCode !== 0) return { deny: 'Cannot inspect worktree input; the lead must verify the project state before dispatch.' }
+        if (dirty.stdout.trim()) return { deny: 'The project has uncommitted changes that a HEAD worktree would omit. Prepare an explicit input snapshot or keep the task with the lead before dispatch.' }
+      } catch { return { deny: 'Cannot verify Git worktree prerequisites; the lead must check the workspace before dispatch.' } }
     }
+    return next(e)
   })
 
   on('agent.spawn', async ($, e, next) => {
@@ -1010,12 +1020,19 @@ export const register: Register = (on, options) => {
         selectionReason: field('SELECTION_REASON') || field('REASON'),
         workspace: typeof cwd === 'string' ? cwd : '',
         changedFiles: [], activities: [],
-        kind: field('KIND'), reviewOf: field('REVIEW_OF'), authorProvider: field('AUTHOR_PROVIDER'),
+        kind: /(?:^|:)savvy-review$/.test(e.subagentType) ? 'review' : field('KIND'), reviewOf: field('REVIEW_OF'), authorProvider: field('AUTHOR_PROVIDER'),
         attempt: Number(field('ATTEMPT')) || round,
       }
       return [...list.filter(a => a.id !== run.id), run].slice(-200)
     })
     await update($, now, () => at)
+    if (savvyWorker(e.subagentType)) {
+      const active = (await read($, agents)).filter(a => savvyWorker(a.type) && a.status === 'running').length
+      await update($, flow, prev => {
+        const base = prev && !prev.isFinished ? prev : blank()
+        return { ...base, running: active, phase: base.phase === 'plan' ? 'delegate' : base.phase }
+      })
+    }
     if (savvyWorker(e.subagentType)) {
       const f = await read($, flow)
       await autoOpen($, f && !f.isFinished ? f.title : 'savvy-codex')
@@ -1093,9 +1110,8 @@ export const register: Register = (on, options) => {
         }),
       )
       await update($, now, () => at)
-    } else if (e.reason === 'answer') {
-      const [native, external] = await Promise.all([read($, agents), codexJobs($)])
-      if (!native.some(agent => agent.status === 'running') && !external.some(isActive)) await finishWorkflow($)
+      const active = (await read($, agents)).filter(a => savvyWorker(a.type) && a.status === 'running').length
+      await update($, flow, prev => prev ? { ...prev, running: active } : prev)
     }
     return next(e)
   })
@@ -1273,7 +1289,7 @@ export const register: Register = (on, options) => {
             {progress === null ? <Text dimColor>{ctxBar(ctx, barW)}</Text> : <Text color={color}>{ctxBar(progress * 100, barW)}</Text>}
             <Text dimColor>
               {' '}
-              {steps}{s.ctx} {ctx}% · {fmtTokens(a.contextTokens)}{costText(a)} {fmtTime(elapsed(a, at))}
+              {steps}{s.ctx} {a.contextMax ? `${ctx}%` : '未知'} · {fmtTokens(a.contextTokens)}{costText(a)} {fmtTime(elapsed(a, at))}
             </Text>
           </Text>
         </Box>

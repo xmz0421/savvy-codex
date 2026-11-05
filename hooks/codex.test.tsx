@@ -2,6 +2,8 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { EngineInterface, On } from 'claude-code'
 import type { CodexJob } from '../types'
+import { assertHostToolResult, nativeReadFixture, nativeWriteFixture } from './host-contract'
+import { pathPolicyCases } from '../shared/path-policy-cases'
 import { absolutePath, CODEX_DELEGATE, CODEX_STATUS, mergeState, normalizeScopes, normalizeStatus, POLL_MS, previewFiles, sensitivePath, within, workerCommand } from './codex'
 
 const ROOT = 'E:/workspace'
@@ -39,6 +41,7 @@ function completed(status = 'complete') {
 }
 
 type WorldOptions = {
+  gitState?: 'non-git' | 'dirty'
   env?: Record<string, string>
   packet?: object
   start?: object
@@ -68,6 +71,7 @@ function world(on: On, options: WorldOptions = {}) {
   const notices: string[] = []
   const reads: string[] = []
   const registered: string[] = []
+  const deferred: Record<string, boolean | undefined> = {}
   const links = new Set<string>()
   const sizes: Record<string, number> = {}
   let modelCalls = 0
@@ -77,6 +81,7 @@ function world(on: On, options: WorldOptions = {}) {
   on('settings.read', () => ok({ language: 'zh' }))
   on('tool.register', (_$, e) => {
     registered.push(e.name)
+    deferred[e.name] = e.isDeferred
     return ok({ tool: `mcp__savvy-codex__${e.name}` })
   })
   on('command.register', (_$, e) => ok({ command: e.name }))
@@ -99,6 +104,7 @@ function world(on: On, options: WorldOptions = {}) {
   })
   on('process.run', async (_$, e) => {
     const argv = [...e.argv]
+    if (argv[0] === 'git' && options.gitState) return ok({ exitCode: options.gitState === 'non-git' ? 128 : 0, stdout: argv[1] === 'status' ? ' M input.ts\n' : 'fixture-head', stderr: '' })
     runs.push({ argv, cwd: e.init?.cwd, timeoutMs: e.init?.timeoutMs })
     if (argv[0] !== PYTHON || argv[1] !== HELPER) throw new Error('Unexpected executable in a mocked test')
     const response = (data: object, exitCode = 0) => ok({ exitCode, stdout: JSON.stringify(data), stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
@@ -122,14 +128,24 @@ function world(on: On, options: WorldOptions = {}) {
     if (argv[2] === 'cleanup') return response({ status: 'complete', dry_run: argv.includes('--dry-run'), deleted: [], would_delete: [], skipped: [], errors: [] })
     throw new Error('Unexpected helper command')
   })
-  return { clock, files, runs, opened, copied, notices, reads, registered, links, sizes, modelCalls: () => modelCalls }
+  return { clock, files, runs, opened, copied, notices, reads, registered, deferred, links, sizes, modelCalls: () => modelCalls }
 }
 
 const start = async ($: Engine) => {
   await $.session.start({ source: 'startup', cwd: ROOT, surface: 'desktop', isInteractive: true } as never)
   await $.command.run({ command: 'savvy-start', args: '' } as never)
 }
-const call = ($: Engine, value: object) => $.tool.call(value as never)
+// Assert the wire contract BEFORE JSON decoding for assertions. Raw objects
+// returned by registered handlers fail here and cannot be made valid by a mock.
+const call = async ($: Engine, value: object) => {
+  const raw = await $.tool.call(value as never)
+  const event = value as { tool: string }
+  assertHostToolResult(event.tool, raw)
+  if (event.tool.startsWith('mcp__savvy-codex__')) {
+    return { ...raw, result: typeof raw.result === 'string' && /^[{[]/.test(raw.result) ? JSON.parse(raw.result) : raw.result }
+  }
+  return raw
+}
 const mount = ($: Engine, surface: 'desktop' | 'terminal' = 'desktop') => $.ui.mount({ plugin: 'savvy-codex', surface, component: 'Pane', requestId: 'savvy-agents', props: PANE })
 
 const environment = (env: Record<string, string>) => ({ env: { get: async (key: string) => env[key] } }) as unknown as EngineInterface
@@ -344,16 +360,19 @@ test('worker environment prevents recursion and unknown run directories grant no
 
 test('preview rejects a symlink and size growth; it never executes changed files', async ($, on) => {
   const w = world(on)
+  const snapshot = `${RUN}/workspace`
+  w.files[`${snapshot}/src/checked.ts`] = 'snapshot text'
   await start($)
   await call($, INPUT)
-  w.files[STATE] = JSON.stringify(completed())
+  w.files[STATE] = JSON.stringify({ ...completed(), execution_workspace: { path: snapshot, scope_paths: ['src'] } })
   await call($, { tool: CODEX_STATUS, job_id: ID })
-  w.links.add(`${ROOT}/src`)
+  w.links.add(`${snapshot}/src`)
   const pane = await mount($)
   await pane.press({ key: `codex-row-${ID}` })
   await pane.press({ key: `codex-file-${ID}-2` })
   expect(JSON.stringify(await pane.drawn())).toContain('符号链接或目录联接')
   expect(w.reads).not.toContain(`${ROOT}/src/checked.ts`)
+  expect(w.reads).not.toContain(`${snapshot}/src/checked.ts`)
   await pane.press({ key: 'codex-back' })
   w.sizes[REPORT] = 300_000
   await pane.press({ key: `codex-file-${ID}-0` })
@@ -361,13 +380,17 @@ test('preview rejects a symlink and size growth; it never executes changed files
   expect(w.runs.map(run => run.argv[2])).toEqual(['start', 'status'])
 })
 
-test('preview rejects invalid UTF-8 and a file that grows beyond its stat size', async ($, on) => {
+test('preview preserves legal U+FFFD and rejects NUL or growth beyond stat size', async ($, on) => {
   const w = world(on)
   await start($)
   await call($, INPUT)
   w.files[REPORT] = 'invalid \uFFFD text'
   const pane = await mount($)
   await pane.press({ key: `codex-row-${ID}` })
+  await pane.press({ key: `codex-file-${ID}-0` })
+  expect((await pane.findAll({ type: 'Code' }))[0]?.props.source).toContain('\uFFFD')
+  await pane.press({ key: 'codex-back' })
+  w.files[REPORT] = 'binary\0data'
   await pane.press({ key: `codex-file-${ID}-0` })
   expect(JSON.stringify(await pane.drawn())).toContain('UTF-8')
   expect(await pane.findAll({ type: 'Code' })).toHaveLength(0)
@@ -436,7 +459,9 @@ test('file allowlist rejects traversal, credential files, ADS and unrelated arti
     id: ID, workspace: ROOT, runDir: RUN, reportPath: REPORT, resultPath: FINAL,
     changedFiles: ['src/checked.ts', '../outside.txt', '.env', '.env.local', '.aws/credentials', 'auth.json', 'private.pem', 'safe.ts:secret', 'https://example.test/x', 'C:/outside.ts'],
   } as CodexJob
-  expect(previewFiles(job).map(file => file.path)).toEqual([REPORT, FINAL, `${ROOT}/src/checked.ts`])
+  // Missing execution metadata never grants permission to preview main files.
+  expect(previewFiles(job).map(file => file.path)).toEqual([REPORT, FINAL])
+  expect(previewFiles({ ...job, executionWorkspace: `${RUN}/workspace`, scopePaths: ['src'] }).map(file => file.path)).toEqual([REPORT, FINAL, `${RUN}/workspace/src/checked.ts`])
   expect(sensitivePath('E:/p/.ssh/id_ed25519')).toBe(true)
   expect(sensitivePath('E:/p/tokenizer.ts')).toBe(false)
   expect(within('E:/workspace', 'E:/workspace-other/x')).toBe(false)
@@ -495,7 +520,7 @@ for (const surface of ['desktop', 'terminal'] as const) {
     w.files[isolated] = 'export const result = 42\n'
     const task = 'KIND: implementation\nAUTHOR_PROVIDER: claude\nATTEMPT: 2\nSELECTION_REASON: This task needs careful boundary validation.\nFull task: inspect the parser, implement the authorized adjustment, and report actual checks.'
     on('agent.spawn', () => ({ model: 'claude-test-model', agentId: 'native-details' }))
-    on('tool.call', (_$, event) => ({ result: event.tool === 'Write' ? 'File written' : 'ok' }))
+    on('tool.call', (_$, event) => event.tool === 'Write' ? nativeWriteFixture(isolated, 'authorized contents') as never : nativeReadFixture(isolated, 'authorized contents') as never)
     on('turn.complete', () => ({ text: '' }) as never)
     await start($)
     await $.agent.spawn({ tool_use_id: 'native-details', prompt: task, description: 'Native task', subagentType: 'savvy-codex:savvy-medium', provider: 'engine', parentModel: 'claude-test-model', background: false, fork: false } as never)
@@ -526,17 +551,17 @@ test('native review metadata links a real completed reviewer and rejects write a
   const w = world(on)
   let actualToolCalls = 0
   on('agent.spawn', () => ({ model: 'claude-review-model', agentId: 'reviewer' }))
-  on('tool.call', () => { actualToolCalls++; return { result: 'ok' } })
+  on('tool.call', () => { actualToolCalls++; return nativeReadFixture(`${ROOT}/src/checked.ts`, 'export const checked = true') as never })
   on('turn.complete', () => ({ text: '' }) as never)
   await start($)
   await $.agent.spawn({ tool_use_id: 'reviewer', prompt: `KIND: review\nREVIEW_OF: ${ID}\nAUTHOR_PROVIDER: codex\nSELECTION_REASON: Independent read-only check.`, description: 'Independent reviewer', subagentType: 'savvy-codex:savvy-careful', provider: 'engine', parentModel: 'claude-review-model', background: false, fork: false } as never)
-  expect(await call($, { tool: 'Write', agentId: 'reviewer', file_path: `${ROOT}/src/checked.ts` })).toMatchObject({ result: { status: 'blocked' } })
-  expect(await call($, { tool: 'Bash', agentId: 'reviewer', command: 'echo mutation' })).toMatchObject({ result: { status: 'blocked' } })
-  expect(await call($, { tool: 'mcp__filesystem__write_file', agentId: 'reviewer', path: `${ROOT}/src/checked.ts` })).toMatchObject({ result: { status: 'blocked' } })
-  expect(await call($, { tool: 'mcp__document__execute_document_tool', agentId: 'reviewer', action: 'delete' })).toMatchObject({ result: { status: 'blocked' } })
-  expect(await call($, { tool: 'mcp__untrusted__Read', agentId: 'reviewer' })).toMatchObject({ result: { status: 'blocked' } })
-  expect(await call($, { tool: 'UnknownTool', agentId: 'reviewer' })).toMatchObject({ result: { status: 'blocked' } })
-  expect(await call($, { tool: 'Agent', agentId: 'reviewer', subagent_type: 'general-purpose', prompt: 'nested' })).toMatchObject({ result: { status: 'blocked' } })
+  expect(await call($, { tool: 'Write', agentId: 'reviewer', file_path: `${ROOT}/src/checked.ts` })).toMatchObject({ deny: expect.stringContaining('read-only') })
+  expect(await call($, { tool: 'Bash', agentId: 'reviewer', command: 'echo mutation' })).toMatchObject({ deny: expect.stringContaining('read-only') })
+  expect(await call($, { tool: 'mcp__filesystem__write_file', agentId: 'reviewer', path: `${ROOT}/src/checked.ts` })).toMatchObject({ deny: expect.stringContaining('read-only') })
+  expect(await call($, { tool: 'mcp__document__execute_document_tool', agentId: 'reviewer', action: 'delete' })).toMatchObject({ deny: expect.stringContaining('read-only') })
+  expect(await call($, { tool: 'mcp__untrusted__Read', agentId: 'reviewer' })).toMatchObject({ deny: expect.stringContaining('read-only') })
+  expect(await call($, { tool: 'UnknownTool', agentId: 'reviewer' })).toMatchObject({ deny: expect.stringContaining('read-only') })
+  expect(await call($, { tool: 'Agent', agentId: 'reviewer', subagent_type: 'general-purpose', prompt: 'nested' })).toMatchObject({ deny: expect.stringContaining('read-only') })
   await call($, { tool: 'Read', agentId: 'reviewer', file_path: `${ROOT}/src/checked.ts` })
   expect(actualToolCalls).toBe(1)
   await ($.turn.complete as (event: unknown) => Promise<unknown>)({ agentId: 'reviewer', reason: 'answer', answer: 'Reviewed actual code; no new issue.' })
@@ -556,6 +581,7 @@ test('snapshot previews use execution scope and never substitute parent workspac
   expect(previewFiles(job).map(file => file.path)).toEqual([REPORT, FINAL, `${RUN}/changes.patch`, `${RUN}/changes.json`, `${snapshot}/src/checked.ts`])
   expect(previewFiles({ ...job, scopePaths: ['../'] }).some(file => file.path === `${snapshot}/src/checked.ts`)).toBe(false)
   expect(previewFiles({ ...job, executionWorkspace: 'C:/Users/Test/Documents', scopePaths: ['.'] }).some(file => file.path.includes('Documents'))).toBe(false)
+  expect(previewFiles({ ...job, executionWorkspace: undefined }).map(file => file.path)).toEqual([REPORT, FINAL, `${RUN}/changes.patch`, `${RUN}/changes.json`])
 })
 
 test('catalog and retention are explicit helper commands; defaults use cached catalog and a dry run', async ($, on) => {
@@ -621,13 +647,17 @@ test('a failed cross-provider review launch retains author, parent and attempt m
   expect(w.runs).toHaveLength(1)
 })
 
-test('a main final answer ends idle manual activation; child completions and background work do not', async ($, on) => {
+test('manual permission survives planning and approval turns; only explicit finish consumes it', async ($, on) => {
   const w = world(on)
   on('agent.spawn', () => ({ model: 'claude-test-model', agentId: 'background-native' }))
   on('turn.complete', () => ({ text: '' }) as never)
   const finish = (agentId?: string) => ($.turn.complete as (event: unknown) => Promise<unknown>)({ agentId, reason: 'answer', answer: 'Actual completion.' })
   const allowed = () => call($, { tool: 'mcp__savvy-codex__workflow_control', action: 'status' })
   await start($)
+  await finish() // plan returned before the user approval
+  expect(await allowed()).toMatchObject({ result: { allowed: true } })
+  await finish() // user approved in another turn
+  expect(await allowed()).toMatchObject({ result: { allowed: true } })
   await $.agent.spawn({ tool_use_id: 'background-native', prompt: 'Actual native task.', description: 'background native', subagentType: 'savvy-codex:savvy-medium', provider: 'engine', parentModel: 'claude-test-model', background: true, fork: false } as never)
   await finish()
   expect(await allowed()).toMatchObject({ result: { mode: 'manual', allowed: true } })
@@ -643,10 +673,124 @@ test('a main final answer ends idle manual activation; child completions and bac
   w.files[STATE] = JSON.stringify(completed())
   await w.clock.advance(POLL_MS)
   await finish()
-  expect(await allowed()).toMatchObject({ result: { mode: 'manual', allowed: false } })
+  expect(await allowed()).toMatchObject({ result: { mode: 'manual', allowed: true } })
+  await call($, { tool: 'mcp__savvy-codex__workflow_control', action: 'finish' })
+  expect(await allowed()).toMatchObject({ result: { allowed: false } })
   await $.command.run({ command: 'savvy-mode', args: 'auto' } as never)
   await finish()
   expect(await allowed()).toMatchObject({ result: { mode: 'auto', allowed: true } })
   expect(w.runs).toHaveLength(1)
   expect(w.modelCalls()).toBe(0)
+})
+
+test('ordinary source names survive shared scope policy and excluded paths warn visibly', async ($, on) => {
+  const scopes = ['tokens.ts', 'secret.md', 'credentials.py', '.env.local']
+  const w = world(on, { packet: { goal: GOAL, reason: REASON, scope_paths: scopes } })
+  await start($)
+  const raw = await call($, INPUT)
+  expect(normalizeScopes(ROOT, scopes)).toEqual(scopes.slice(0, 3))
+  expect(raw).toMatchObject({ result: { scope_paths: scopes.slice(0, 3), scope_warnings: [expect.stringContaining('.env.local')] } })
+  expect(w.notices.join(' ')).toContain('.env.local')
+  expect(normalizeScopes('E:/.claude/worktrees/repo', ['tokens.ts'])).toEqual(['tokens.ts'])
+})
+
+test('TypeScript and Python use the same canonical sensitive-path fixture expectations', () => {
+  for (const example of pathPolicyCases) expect(sensitivePath(example.path)).toBe(example.denied)
+})
+
+test('only step stays eager; other registered collaboration tools are deferred', async ($, on) => {
+  const w = world(on)
+  await start($)
+  expect(w.deferred.step).toBe(false)
+  for (const name of ['progress', 'codex_delegate', 'codex_status', 'codex_catalog', 'codex_cleanup', 'workflow_control']) expect(w.deferred[name]).toBe(true)
+})
+
+test('Codex title and plan_task_id match planned rows independently of prose goal', async ($, on) => {
+  const w = world(on, { packet: { goal: GOAL, reason: REASON, title: 'Short title', plan_task_id: 'task-123' } })
+  await start($)
+  await call($, { tool: 'mcp__savvy-codex__progress', title: 'Metadata', tasks: [{ id: 'task-123', title: 'Different planned title', provider: 'codex' }] })
+  expect(await call($, INPUT)).toMatchObject({ result: { title: 'Short title', plan_task_id: 'task-123', job_id: ID } })
+  const pane = await mount($)
+  expect(JSON.stringify(await pane.drawn())).not.toContain('Different planned title')
+  expect(w.runs).toHaveLength(1)
+})
+
+test('background native running survives async Agent return and ends on actual completion', async ($, on) => {
+  world(on)
+  on('agent.spawn', () => ({ model: 'claude-test', agentId: 'async-native' }))
+  on('turn.complete', () => ({ text: '' }) as never)
+  on('tool.call', { tool: 'Agent' }, async (_$, event) => {
+    return { result: { status: 'async_launched', agentId: 'async-native', description: 'Background task', prompt: event.prompt, outputFile: '/tmp/native-output' } } as never
+  })
+  await start($)
+  await $.agent.spawn({ tool_use_id: 'async-native', prompt: 'Authorized fixture', description: 'Background task', subagentType: 'savvy-codex:savvy-medium', provider: 'engine', parentModel: 'claude-test', background: true, fork: false } as never)
+  await call($, { tool: 'Agent', subagent_type: 'savvy-codex:savvy-medium', prompt: 'Authorized fixture', run_in_background: true })
+  const showsRunning = async (count: number) => {
+    const band = await $.ui.mount({ plugin: 'savvy-codex', surface: 'terminal', component: 'AbovePrompt', props: BAND as never })
+    expect(await band.find({ type: 'Text', text: new RegExp(`${count} 执行中`) })).toBeDefined()
+    await band.unmount()
+  }
+  await showsRunning(1)
+  await ($.turn.complete as (event: unknown) => Promise<unknown>)({ reason: 'answer', answer: 'Lead is waiting for worker.' })
+  await showsRunning(1)
+  await ($.turn.complete as (event: unknown) => Promise<unknown>)({ agentId: 'async-native', reason: 'answer', answer: 'Worker actually completed.' })
+  await showsRunning(0)
+})
+
+test('a denied native Read is observed as failed, never as a successful tool activity', async ($, on) => {
+  world(on)
+  on('agent.spawn', () => ({ model: 'claude-test', agentId: 'denied-read' }))
+  on('tool.call', { tool: 'Read' }, () => ({ deny: 'fixture permission denied' }))
+  await start($)
+  await $.agent.spawn({ tool_use_id: 'denied-read', prompt: 'Read code', description: 'Read fixture', subagentType: 'savvy-codex:savvy-review', provider: 'engine', parentModel: 'claude-test', background: false, fork: false } as never)
+  expect(await call($, { tool: 'Read', agentId: 'denied-read', file_path: `${ROOT}/src/checked.ts` })).toMatchObject({ deny: 'fixture permission denied' })
+  const pane = await mount($)
+  await pane.press({ key: 'claude-row-denied-read' })
+  expect(JSON.stringify(await pane.drawn())).toContain('failed')
+})
+
+for (const state of ['non-git', 'dirty']) {
+  test(`explicit native worktree dispatch refuses ${state} input before Agent starts`, async ($, on) => {
+    world(on, { gitState: state as 'non-git' | 'dirty' })
+    let agents = 0
+    on('tool.call', { tool: 'Agent' }, () => { agents++; throw new Error('must not dispatch') })
+    await start($)
+    const raw = await call($, { tool: 'Agent', subagent_type: 'savvy-codex:savvy-medium', prompt: 'Write code', isolation: 'worktree' })
+    expect(raw).toMatchObject({ deny: expect.stringContaining(state === 'dirty' ? 'uncommitted' : 'existing commit') })
+    expect(agents).toBe(0)
+  })
+}
+
+test('savvy-check exercises actual registered wire results with zero delegation and model calls', async ($, on) => {
+  const w = world(on)
+  await $.session.start({ source: 'startup', cwd: ROOT, surface: 'desktop', isInteractive: true } as never)
+  const result = await $.command.run({ command: 'savvy-check', args: '' } as never)
+  expect(result).toMatchObject({ text: expect.stringContaining('workflow_control: wire OK') })
+  expect(result).toMatchObject({ text: expect.stringContaining('codex_status: wire OK') })
+  expect(result).toMatchObject({ text: expect.stringContaining('codex_catalog: wire OK') })
+  expect(w.runs.map(run => run.argv[2])).toEqual(['catalog'])
+  expect(w.modelCalls()).toBe(0)
+  expect(await call($, { tool: 'mcp__savvy-codex__workflow_control', action: 'status' })).toMatchObject({ result: { allowed: false, host_version: expect.any(String), host_compatibility: expect.any(String) } })
+})
+
+for (const placement of ['top', 'execution']) {
+  test(`actual input classes and bounded readonly statistics survive ${placement} state and appear in details`, async ($, on) => {
+    const w = world(on)
+    await start($)
+    await call($, INPUT)
+    const metadata = { context_paths: ['docs/spec.md'], dependency_paths: ['node_modules'], verification_output_paths: ['reports/check.txt'], implicit_context_paths: ['AGENTS.md'], read_only_paths: ['docs/spec.md', 'AGENTS.md'], read_only_file_count: 18000, read_only_paths_truncated: true }
+    w.files[STATE] = JSON.stringify({ ...completed(), ...(placement === 'top' ? metadata : {}), execution_workspace: { path: `${RUN}/workspace`, scope_paths: ['src'], ...(placement === 'execution' ? metadata : {}) } })
+    expect(await call($, { tool: CODEX_STATUS, job_id: ID })).toMatchObject({ result: { ...metadata, scope_paths: ['src'] } })
+    const pane = await mount($)
+    await pane.press({ key: `codex-row-${ID}` })
+    const text = JSON.stringify(await pane.drawn())
+    for (const expected of ['docs/spec.md', 'node_modules', 'reports/check.txt', 'AGENTS.md', '18000', '样本']) expect(text).toContain(expected)
+    expect(w.modelCalls()).toBe(0)
+  })
+}
+
+test('execution verification entries are displayed when the top level output list is missing', () => {
+  const previous = { id: ID, workspace: ROOT, runDir: RUN, reportPath: REPORT, resultPath: FINAL } as CodexJob
+  const merged = mergeState(previous, { execution_workspace: { path: `${RUN}/workspace`, verification_output_entries: [{ path: 'artifacts/check.txt', type: 'file' }] } })
+  expect(merged.verificationOutputPaths).toEqual(['artifacts/check.txt'])
 })

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.5.0-codex.1
+
+- Repair registered-tool wire results and native-tool denials, with negative host-contract fixtures and mandatory native Hook CI on Claude Code 2.1.317.
+- Keep manual activation across planning/approval turns until explicit completion; add /savvy-check for inference-free tool-chain diagnostics.
+- Separate source edits, immutable context/dependencies and verification outputs; support parallel isolated jobs and durable Windows state updates.
+- Verify effective per-run sandbox policy, cache only suitable preflight facts, and reject incompatible permission configurations.
+- Remove unconditional Claude worktrees, add a shared read-only review worker, repair stable task association and real background counts.
+- Unify path rules, show actual context/limits, avoid source-file fallback previews and unknown context-size guesses.
+- Transactional installation/uninstallation, bounded safe backup retention and post-commit cleanup warnings. See docs/REPAIR_1_5.md for scope and limits.
+
 ## 1.4.0-codex.2
 
 - `/savvy-start <task>` activates the workflow and submits the task to the current Claude session after the command returns. Empty arguments only activate; off mode blocks submission. Submission errors are visible and clear manual activation.

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "denied_path_parts": [".git", ".ssh", ".aws", ".azure", ".gnupg", ".kube", ".codex", ".claude", ".agents", "codex-worker-runs"],
+  "denied_exact_names": [".env", "auth.json", "credentials", "credentials.json", "credentials.ini", ".npmrc", ".netrc", ".pypirc", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "token", "token.json", "secrets.json", "secrets.yaml", "secrets.yml"],
+  "denied_name_prefixes": [".env."],
+  "denied_extensions": [".pem", ".p12", ".pfx", ".key", ".keystore"],
+  "dependency_directory_names": ["node_modules", ".venv", "venv", "__pycache__"],
+  "note": "Additional credential-name guard applied to every relative path component of explicit input/preview allowlists. Normal source names such as tokens.ts, secret.md and credentials.py are not denied. This is not a content-secret detector or an OS sandbox. Dependencies require explicit handling separate from sensitive names."
+}

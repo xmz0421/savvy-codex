@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -20,7 +21,7 @@ import sys
 import tempfile
 
 
-CORE = (".claude-plugin", "skills", "agents", "hooks", "types", "LICENSE", "NOTICE")
+CORE = (".claude-plugin", "skills", "agents", "hooks", "types", "shared", "testfixtures", "LICENSE", "NOTICE")
 START = "<!-- BEGIN SAVVY-CODEX-DELEGATION -->"
 END = "<!-- END SAVVY-CODEX-DELEGATION -->"
 IDENTITY = "savvy-codex@skills-dir"
@@ -193,7 +194,111 @@ def make_backup(claude_home: Path, files: dict[str, bytes | None], destination: 
     return backup
 
 
-def install(source: Path, claude_home: Path, enable_default_workflow: bool = False, *, skip_doctor: bool = False) -> dict:
+BACKUP_MARKER = ".savvy-backup.json"
+
+
+def backup_metadata(backup: Path, claude_home: Path, *, successful: bool) -> None:
+    atomic_write(backup / BACKUP_MARKER, json_bytes({
+        "owner": RECEIPT_OWNER, "plugin_identity": IDENTITY, "schema_version": 1,
+        "backup_path": str(absolute(backup)), "claude_home": str(absolute(claude_home)),
+        "successful": successful,
+    }))
+
+
+def prune_backups(claude_home: Path, keep: int) -> None:
+    """Only remove successful backups that this installer marked and owns."""
+    root = absolute(claude_home) / "backups" / "savvy-codex"
+    check_path(root)
+    candidates = []
+    for entry in root.iterdir():
+        try:
+            check_tree(entry)
+            if (not entry.is_dir() or entry.parent != root
+                    or re.fullmatch(r"\d{8}T\d{6}Z-[a-z0-9_]{8}", entry.name) is None):
+                continue
+            _, info = read_object(entry / BACKUP_MARKER)
+            if (info.get("owner") == RECEIPT_OWNER and info.get("plugin_identity") == IDENTITY
+                    and info.get("schema_version") == 1 and info.get("successful") is True
+                    and info.get("backup_path") == str(absolute(entry))
+                    and info.get("claude_home") == str(absolute(claude_home))):
+                candidates.append(entry)
+        except (OSError, ValueError):
+            continue
+    candidates.sort(key=lambda entry: (entry.stat().st_mtime_ns, entry.name), reverse=True)
+    for entry in candidates[keep:]:
+        check_tree(entry)
+        shutil.rmtree(entry)
+
+
+def commit_transaction(destination: Path, staged: Path | None, package_changed: bool,
+                       mutations: list[tuple[Path, bytes | None, bytes | None]]) -> list[str]:
+    """Keep the old package by sibling rename until every file commit succeeds."""
+    previous = None
+    placed = False
+    attempted = []
+    try:
+        if package_changed:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                previous = Path(tempfile.mkdtemp(prefix=".savvy-codex-rollback-", dir=destination.parent))
+                previous.rmdir()
+                os.replace(destination, previous)
+            if staged is not None:
+                placed = True
+                shutil.move(str(staged), str(destination))
+        for path, before, after in mutations:
+            attempted.append((path, before))
+            if after is None:
+                path.unlink(missing_ok=True)
+            else:
+                atomic_write(path, after)
+    except BaseException as failure:
+        errors = []
+        for path, before in reversed(attempted):
+            try:
+                if before is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    atomic_write(path, before)
+            except (OSError, ValueError) as error:
+                errors.append(str(error))
+        try:
+            if placed and destination.exists():
+                check_tree(destination)
+                shutil.rmtree(destination)
+            if previous is not None and previous.exists():
+                os.replace(previous, destination)
+        except (OSError, ValueError) as error:
+            errors.append(str(error))
+        if errors:
+            raise OSError("Transaction failed; recover from preserved backup/sibling: " + "; ".join(errors)) from failure
+        raise
+    warnings = []
+    if previous is not None:
+        try:
+            check_tree(previous)
+            shutil.rmtree(previous)
+        except (OSError, ValueError) as error:
+            warnings.append(f"Changes committed; old package cleanup could not finish ({type(error).__name__}). Recovery copy retained at {previous}")
+    return warnings
+
+
+def finish_backup(backup: Path, claude_home: Path, keep_backups: int) -> list[str]:
+    """Post-commit housekeeping must not turn a committed install into failure."""
+    try:
+        backup_metadata(backup, claude_home, successful=True)
+    except (OSError, ValueError) as error:
+        return [f"Changes committed; backup completion marker could not be saved ({type(error).__name__}). Backup retained at {backup}; retention was skipped."]
+    try:
+        prune_backups(claude_home, keep_backups)
+    except (OSError, ValueError) as error:
+        return [f"Changes committed; backup retention could not finish ({type(error).__name__}). Remaining backups were preserved under {backup.parent}"]
+    return []
+
+
+def install(source: Path, claude_home: Path, enable_default_workflow: bool = False, *, skip_doctor: bool = False, keep_backups: int = 5) -> dict:
+    if type(keep_backups) is not int or keep_backups < 0:
+        raise ValueError("keep_backups must be a nonnegative integer")
     source, claude_home = absolute(source), absolute(claude_home)
     check_path(source)
     destination, settings_path, claude_path, receipt_path = paths_for(claude_home)
@@ -273,17 +378,16 @@ def install(source: Path, claude_home: Path, enable_default_workflow: bool = Fal
         changes = package_changed or settings_changed or claude_changed or receipt_changed
         if changes:
             backup = make_backup(claude_home, {"settings.json": old_settings, "CLAUDE.md": old_claude if claude_changed else None, RECEIPT_NAME: old_receipt}, destination, package_changed)
-            if package_changed:
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                if destination.exists():
-                    shutil.rmtree(destination)
-                shutil.move(str(staged), str(destination))
+            backup_metadata(backup, claude_home, successful=False)
+            mutations = []
             if settings_changed:
-                atomic_write(settings_path, new_settings)
+                mutations.append((settings_path, old_settings, new_settings))
             if claude_changed:
-                atomic_write(claude_path, new_claude)
+                mutations.append((claude_path, old_claude, new_claude))
             if receipt_changed:
-                atomic_write(receipt_path, new_receipt)
+                mutations.append((receipt_path, old_receipt, new_receipt))
+            warnings.extend(commit_transaction(destination, staged, package_changed, mutations))
+            warnings.extend(finish_backup(backup, claude_home, keep_backups))
     return {"destination": str(destination), "backup": str(backup) if backup else None, "changed": bool(changes), "installer_python": sys.executable, "ready": not skip_doctor, "status": "ready" if not skip_doctor else "installed_but_not_ready", "doctor": doctor, "warnings": warnings, "local_changes": custom_files}
 
 
@@ -297,7 +401,9 @@ def package_is_ours(destination: Path) -> bool:
     return manifest.get("name") == "savvy-codex"
 
 
-def uninstall(claude_home: Path) -> dict:
+def uninstall(claude_home: Path, *, keep_backups: int = 5) -> dict:
+    if type(keep_backups) is not int or keep_backups < 0:
+        raise ValueError("keep_backups must be a nonnegative integer")
     claude_home = absolute(claude_home)
     destination, settings_path, claude_path, receipt_path = paths_for(claude_home)
     old_settings, settings = read_object(settings_path)
@@ -342,14 +448,16 @@ def uninstall(claude_home: Path) -> dict:
     if changes:
         claude_home.mkdir(parents=True, exist_ok=True)
         backup = make_backup(claude_home, {"settings.json": old_settings, "CLAUDE.md": old_claude if claude_changed else None, RECEIPT_NAME: old_receipt}, destination, remove_package)
-        if remove_package:
-            shutil.rmtree(destination)
+        backup_metadata(backup, claude_home, successful=False)
+        mutations = []
         if settings_changed:
-            atomic_write(settings_path, json_bytes(settings))
+            mutations.append((settings_path, old_settings, json_bytes(settings)))
         if claude_changed:
-            atomic_write(claude_path, new_claude)
+            mutations.append((claude_path, old_claude, new_claude))
         if receipt_changed:
-            atomic_write(receipt_path, new_receipt)
+            mutations.append((receipt_path, old_receipt, new_receipt))
+        warnings.extend(commit_transaction(destination, None, remove_package, mutations))
+        warnings.extend(finish_backup(backup, claude_home, keep_backups))
     return {"destination": str(destination), "backup": str(backup) if backup else None, "changed": bool(changes), "status": "uninstalled", "warnings": warnings, "restored_flags": restored, "preserved_flags": skipped}
 
 
@@ -360,9 +468,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--enable-default-workflow", action="store_true", help="Deprecated compatibility option; removes old global workflow block. Select auto in plugin settings.")
     parser.add_argument("--skip-doctor", action="store_true", help="Explicit offline/test installation; readiness stays unverified. Never used by default.")
     parser.add_argument("--uninstall", action="store_true", help="Back up and remove this package, restore owned plugin flags, keep run records/preferences")
+    parser.add_argument("--keep-backups", type=int, default=5, help="Keep this many successful managed backups (default: 5); failed and unknown backups remain")
     args = parser.parse_args(argv)
     try:
-        result = uninstall(args.claude_home) if args.uninstall else install(args.source, args.claude_home, args.enable_default_workflow, skip_doctor=args.skip_doctor)
+        result = uninstall(args.claude_home, keep_backups=args.keep_backups) if args.uninstall else install(args.source, args.claude_home, args.enable_default_workflow, skip_doctor=args.skip_doctor, keep_backups=args.keep_backups)
     except NotReadyError as error:
         status = "Installed but not ready; update refused" if error.installed else "Not installed: not ready"
         print(f"{status}. {error}", file=sys.stderr)

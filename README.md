@@ -9,7 +9,7 @@ Claude 主导，按任务选择 Claude 子代理、Codex worker 或直接完成�
 | 模式 | 新派工行为 |
 | --- | --- |
 | `off` 关闭 | 拒绝新的 Savvy Claude / Codex 派工；已有任务和记录仍可查看 |
-| `manual` 手动（默认） | 用户在侧栏点开始或运行 `/savvy-start` 后，允许当前一轮协作；完成后关闭本轮激活 |
+| `manual` 手动（默认） | 用户在侧栏点开始或运行 `/savvy-start` 后，允许当前任务的跨回合协作；明确完成时结束 |
 | `auto` 自动 | 用户明确选定后，Claude 按任务判断是否值得派工 |
 
 侧栏按钮或 `/savvy-mode off`、`/savvy-mode manual`、`/savvy-mode auto` 切换**当前会话**。插件设置的 `workflowMode` 决定**新会话**默认值，更新插件不覆盖宿主保存的设置。查看面板、切换模式和普通状态刷新不发起模型调用。关闭模式不强行终止已运行的进程。
@@ -26,9 +26,15 @@ echo '{"workflowMode":"manual"}' | claude plugin configure savvy-codex@skills-di
 
 也可一条命令开启并提交任务，例如：`/savvy-start 检查这个项目的测试入口，按需要安排 Claude 和 Codex 配合`。后面的文字会作为任务交给当前 Claude 会话；不带文字时只开启待机，不调用模型。off 模式仍需先切回 manual 或 auto。
 
+**先给计划、等你批准、再派工可以跨多个回合**，普通答复不会自动关闭许可。任务完成后由流程报告 `finished: true`、调用 `workflow_control finish`，或由你点击“结束本次协作”。需要立即停用新派工可切 `off`。不要把仍显示激活的上一任务当成已自动结束。
+
+输入 **`/savvy-check`** 可直接检查当前宿主里的状态、历史列表与本地模型目录工具返回，不启动模型；它会区分工具返回协议是否正常与 Codex 前置条件是否就绪。工具大部分按需发现，只有 worker 的 step 工具常驻。
+
 ## 安装和前置检查
 
-需要 Git、Python 3.10+、支持 `claude-code` Mod/function-hooks 的 Claude Code，以及已通过 **ChatGPT 登录**的官方 Codex CLI。已验证的桌面组合为 Windows、Claude Code 2.1.314、Codex CLI 0.166.0；兼容性按实际所需参数/功能检测，旧版 CLI 可能不兼容。普通网页 Chat / Cowork 不保证侧栏能力，macOS / Linux 桌面尚未实测。
+需要 Git、Python 3.10+、支持 `claude-code` Mod/function-hooks 的 Claude Code，以及已通过 **ChatGPT 登录**的官方 Codex CLI。本轮在 Windows 的 Claude Code **2.1.314 与 2.1.317** 均运行原生 Hook 测试，并验证 Codex CLI **0.166.0** 的配置与功能；其他宿主版本会显示未验证或未知状态。普通网页 Chat / Cowork 不保证侧栏能力，macOS / Linux 桌面尚未实测。
+
+原生测试框架的 mock 不替生产宿主校验工具结果，本项目另外在原始返回边界检查契约：自注册工具返回 JSON 文本，内置工具拒绝返回 `deny`。测试会故意注入旧版错误对象，确认检查能发现它；测试数不能代替真实桌面对话中的复验。
 
 先确认 `claude --version`、`codex --version`、`codex login status`。Windows 建议克隆到短路径（例如 `C:/src/savvy-codex`）；长路径可加 Git 参数：
 
@@ -54,7 +60,7 @@ python scripts/install.py
 
 ## 派工与互审
 
-负责人可以亲自干活。低风险、约 2 个文件 / 60 行以内的修改通常直接完成；复杂的一行安全/并发修改仍可能值得独立复核。先比较上下文转移、执行和验收成本，再拆任务。
+负责人可以亲自干活。低风险、约 2 个文件 / 60 行以内的修改通常直接完成；复杂的一行安全/并发修改仍可能值得独立复核。先比较上下文转移、执行和验收成本，再拆任务。Codex 的同源项目任务使用独立执行副本与任务锁，可以同时运行；最终合并仍由负责人协调。
 
 Codex 的模型和 effort 从账号实时可用目录选择，不在规则里固定某代模型。Claude 的五个旧 tier 名称仅为角色/effort 预设，默认继承当前模型，可按宿主支持的 Agent 参数指定当前可用模型。每次解释具体选择理由。
 
@@ -62,13 +68,28 @@ Codex 的模型和 effort 从账号实时可用目录选择，不在规则里固
 
 ## 文件隔离和交付
 
-Codex 只复制任务 `scope_paths` 明确允许的文件/目录到独立执行副本，保留相关脏文件的当前内容。实施的变更和补丁留在副本，**不自动写回原项目**。程序检查实际新增、修改、删除等变更，越界则阻止补丁交付。测试所需配置、输入与依赖也需在任务范围里明确提供。
+任务包区分四类输入与输出，不再用写入授权换取读取上下文：
 
-Claude worker 使用宿主原生 git worktree 隔离。负责人检查候选补丁、另一家的审查和原文件是否变化，再合并；不让多个写入者同时改主目录。worktree 通常基于提交状态，涉及未提交输入时需显式传入对应改动。
+| 字段 | 用途 |
+| --- | --- |
+| `scope_paths` | 实施允许修改的源码文件/目录 |
+| `context_paths` | 相关源码、规范、测试配置等只读输入 |
+| `dependency_paths` | 显式复制的已有依赖，只读，拒绝链接及敏感路径 |
+| `verification_output_paths` | 实施验证可新建的产物，排除在源码补丁外，不得覆盖已有输入 |
+
+适用的 AGENTS.md / CLAUDE.md 作为只读上下文自动带入；当前脏文件内容照实复制。状态与详情显示实际清单、依赖数量及采样截断，不把大依赖列表全塞回模型上下文。依赖复制有磁盘与时间成本，需选必要路径；不自动安装新环境，也不通过可写链接暴露原依赖。
+
+实施的变更和补丁留在副本，**不自动写回原项目**。程序检查源码范围、不可改输入和新验证产物，越界或改动只读输入就阻止交付。只读任务保持只读沙箱，可运行不落盘的检查；需要生成文件的验证交由负责人在已授权的验证环境执行，不会暗中提高复核权限。
+
+实施若显式授权了新的验证产物目录，临时目录会设置到该目录的 `tmp` 下（TMP/TEMP/TMPDIR），避免标准测试又去系统临时目录写入；缓存也应配置在授权输出目录。只声明单个产物文件或只读任务时，不会自动增加临时目录写权限。
+
+Claude worker 不再固定 worktree。只读 `savvy-review` 使用当前文件，不要求 Git、HEAD 或干净工作树；写任务只有在明确请求、Git 已提交且工作区干净时才用宿主 worktree。非 Git 或含未提交输入时，选择保留当前文件的 Codex 副本，或由负责人串行修改；不为隔离而重置、提交或隐藏用户改动。负责人检查候选补丁、另一家的审查和原文件是否变化，再合并。
 
 Claude 子代理的模型覆盖与 worktree 选项以[宿主文档](https://code.claude.com/docs/en/sub-agents)和实际工具 schema 为准；已有 tier 不是某个固定模型的承诺。
 
 这些是最小输入副本与交付范围控制，**不等于操作系统逐文件访问围栏**。外部路径/工具权限由 CLI 与宿主沙箱控制；不能承诺任何宿主上都完全无法读到外部文件。敏感目录拒绝规则仍是附加防护，不能代替任务允许清单。目录范围应尽量小，不把整个项目加入只为方便。
+
+实施显式固定 workspace-write、禁用额外 writable roots 与直接网络，并读取实际生效策略。检测到不兼容的现代命名权限配置或无法证明策略符合要求时会阻止运行，不改写用户全局配置。CLI 静态能力有短时缓存，但每次仍核对实际权限；认证缓存只表示本地登录状态，不保证远端额度或令牌仍有效。策略依据见 [官方配置参考](https://learn.chatgpt.com/docs/config-file/config-reference)。
 
 ## 失败和记录维护
 
@@ -80,7 +101,7 @@ Claude 子代理的模型覆盖与 worktree 选项以[宿主文档](https://code
 
 ## 更新、卸载与验证
 
-更新：`git pull` 后重新运行安装器。已有包内自定义修改会检测并备份、报告；持久偏好应放插件设置，别改 skill 源码。
+更新：`git pull` 后重新运行安装器。已有包内自定义修改会检测并备份、报告；持久偏好应放插件设置，别改 skill 源码。包和配置提交失败会回滚；提交成功后的旧目录清理失败只给出警告并保留恢复路径。安装器默认只保留最近 5 份带本插件成功标记的备份，可用 `--keep-backups N` 调整；失败、未知和链接备份不会自动裁剪。
 
 卸载：
 
@@ -95,8 +116,13 @@ python scripts/install.py --uninstall
 ```sh
 python -m unittest discover -s skills/codex-worker/scripts -p "test_*.py"
 python -m unittest discover -s tests -p "test_*.py"
+python scripts/sync_policy.py --check
 claude plugin validate --json .
 claude plugin test .
 ```
 
-GitHub CI 检查 Windows / Ubuntu 的 Python 3.10、3.12；原生界面另由宿主插件测试验证，不能把 CI 通过等同所有桌面版本实测。反馈请附版本、复现步骤和脱敏错误。见 [NOTICE](NOTICE) 与 [LICENSE](LICENSE)。本社区项目与 Anthropic / OpenAI 无隶属关系。
+GitHub CI 检查 Windows / Ubuntu 的 Python 3.10、3.12，并安装固定官方 Claude Code 2.1.317 实际运行 `claude plugin test`；共享 JSON 与生成 TS 的一致性也必须通过。CI 不包含账号或模型推理。具备 Codex CLI 的本机可设置 `SAVVY_CLI_INTEGRATION=1` 执行无模型的真实 CLI 配置测试。
+
+已知宿主限制：预览 API 只提供解码文本，合法 U+FFFD 会保留，无法保证识别宿主静默替换的损坏字节；宿主无法安全解析符号链接时仍拒绝预览，macOS 的 `/var`、`/tmp` 别名请使用解析后的真实路径或用户目录。未提供的上下文窗口容量显示未知。旧记录缺少可信执行副本时只开放报告/JSON/补丁，不会把主项目当前文件当成 worker 的候选文件。
+
+本轮逐项处理与验证边界见 [修复记录](docs/REPAIR_1_5.md)。反馈请附版本、复现步骤和脱敏错误。见 [NOTICE](NOTICE) 与 [LICENSE](LICENSE)。本社区项目与 Anthropic / OpenAI 无隶属关系。

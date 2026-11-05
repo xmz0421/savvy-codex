@@ -84,11 +84,17 @@ test('cost: unknown and legacy prices are not displayed by default', async ($, o
   expect(await shows($, /≈\$/)).toBeUndefined()
 })
 
-// The context bar: 130K tokens are 13% of Haiku 5.5's 1M window and 65% of Haiku 4.5's 200K.
-for (const [model, percent] of [['claude-haiku-5-5', 13], ['claude-haiku-4-5', 65]] as const) {
+// Explicit context markers are evidence; an unmarked family has unknown capacity.
+for (const [model, percent] of [['claude-haiku-5-5[1m]', 13], ['claude-haiku-4-5[200k]', 65]] as const) {
   test(`context: ${model} fills to ${percent}% at 130K tokens`, async ($, on) => {
     await worker($, on, model, LONG)
     await step($, model)
     expect(await shows($, new RegExp(`ctx ${percent}%`))).toBeDefined()
   })
 }
+
+test('context: an unmarked model reports unknown capacity', async ($, on) => {
+  await worker($, on, 'claude-sonnet-unknown', LONG)
+  await step($, 'claude-sonnet-unknown')
+  expect(await shows($, /ctx 未知/)).toBeDefined()
+})
