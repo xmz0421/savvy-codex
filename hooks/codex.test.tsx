@@ -6,9 +6,12 @@ import { assertHostToolResult, nativeReadFixture, nativeWriteFixture } from './h
 import { pathPolicyCases } from '../shared/path-policy-cases'
 import { absolutePath, CODEX_DELEGATE, CODEX_STATUS, mergeState, normalizeScopes, normalizeStatus, POLL_MS, previewFiles, sensitivePath, within, workerCommand } from './codex'
 
-const ROOT = 'E:/workspace'
-const PYTHON = 'python'
-const HOME = 'C:/Users/Test'
+// The native sandbox has no process/Bun global. Its actual source URL still
+// identifies drive-based hosts, so the virtual project uses native path syntax.
+const WINDOWS_HOST = /^file:\/\/\/[A-Za-z]:\//i.test(import.meta.url)
+const ROOT = WINDOWS_HOST ? 'E:/workspace' : '/workspace'
+const PYTHON = WINDOWS_HOST ? 'python' : 'python3'
+const HOME = WINDOWS_HOST ? 'C:/Users/Test' : '/home/test'
 const PACKET = `${ROOT}/packet.json`
 const ID = '20261103T010000Z-test'
 const RUN = `${HOME}/.claude/codex-worker-runs/abc123/${ID}`
@@ -56,7 +59,7 @@ type WorldOptions = {
 function world(on: On, options: WorldOptions = {}) {
   const clock = mock.clock(on, { now: Date.parse(STARTED) })
   mock.store(on)
-  mock.env(on, { USERPROFILE: HOME, OS: 'Windows_NT', LANG: 'zh_CN.UTF-8', ...options.env })
+  mock.env(on, { USERPROFILE: WINDOWS_HOST ? HOME : '', HOME, OS: WINDOWS_HOST ? 'Windows_NT' : 'Linux', LANG: 'zh_CN.UTF-8', ...options.env })
   const files: Record<string, string> = {
     [PACKET]: JSON.stringify(options.packet ?? { goal: GOAL, reason: REASON }),
     [STATE]: JSON.stringify(queued()),
@@ -149,6 +152,15 @@ const call = async ($: Engine, value: object) => {
 const mount = ($: Engine, surface: 'desktop' | 'terminal' = 'desktop') => $.ui.mount({ plugin: 'savvy-codex', surface, component: 'Pane', requestId: 'savvy-agents', props: PANE })
 
 const environment = (env: Record<string, string>) => ({ env: { get: async (key: string) => env[key] } }) as unknown as EngineInterface
+
+test('virtual filesystem uses the native host path syntax while Windows guards remain strict', () => {
+  expect(absolutePath(ROOT)).toBe(ROOT)
+  expect(absolutePath(HOME)).toBe(HOME)
+  expect(ROOT).toBe(WINDOWS_HOST ? 'E:/workspace' : '/workspace')
+  expect(absolutePath('E:/workspace/packet.json')).toBe('E:/workspace/packet.json')
+  expect(() => absolutePath('/home/runner/work/savvy/E:/workspace/packet.json')).toThrow()
+  expect(() => absolutePath('E:/workspace/CON.txt')).toThrow()
+})
 
 test('savvy-start forwards a task once after the command returns, without a helper or wrapper agent', async ($, on) => {
   const w = world(on)
@@ -516,7 +528,7 @@ test('user clicks activate manual once; finish consumes it; explicit auto surviv
 for (const surface of ['desktop', 'terminal'] as const) {
   test(`${surface}: native Claude row opens real task, tool activity and an isolated-worktree file, then returns`, async ($, on) => {
     const w = world(on)
-    const isolated = 'E:/isolated-agent-worktree/src/result.ts'
+    const isolated = WINDOWS_HOST ? 'E:/isolated-agent-worktree/src/result.ts' : '/isolated-agent-worktree/src/result.ts'
     w.files[isolated] = 'export const result = 42\n'
     const task = 'KIND: implementation\nAUTHOR_PROVIDER: claude\nATTEMPT: 2\nSELECTION_REASON: This task needs careful boundary validation.\nFull task: inspect the parser, implement the authorized adjustment, and report actual checks.'
     on('agent.spawn', () => ({ model: 'claude-test-model', agentId: 'native-details' }))
