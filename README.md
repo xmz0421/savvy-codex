@@ -22,9 +22,9 @@ echo '{"workflowMode":"manual"}' | claude plugin configure savvy-codex@skills-di
 
 将 manual 换为 off 或 auto 后重新开启会话。通过 `claude plugin configure savvy-codex@skills-dir --json` 查看当前插件选项；自定义 Python 也可用同一接口设置 `pythonPath`。
 
-手动试用：新建 Claude Desktop **Code** 会话，运行 `/savvy-start`，再说“用 Savvy 检查这个项目的测试入口，让 Codex 做一次只读调查，显示模型和思考强度”。`/savvy-codex:savvy-flow` 是流程说明入口，单独加载技能不会绕过手动开关。`codex-worker` 是内部组件，不是另一个日常入口。
+手动试用：新建 Claude Desktop **Code** 会话，直接输入 `/savvy-start 检查这个项目的测试入口，按需要安排 Claude 和 Codex 配合`。这一条会开启本轮协作、立即打开同一个 Agents 侧栏，并提交任务，日常不必再输入 `/agents-info`。`/savvy-codex:savvy-flow` 是流程说明入口，单独加载技能不会绕过手动开关。`codex-worker` 是内部组件，不是另一个日常入口。
 
-也可一条命令开启并提交任务，例如：`/savvy-start 检查这个项目的测试入口，按需要安排 Claude 和 Codex 配合`。后面的文字会作为任务交给当前 Claude 会话；不带文字时只开启待机，不调用模型。off 模式仍需先切回 manual 或 auto。
+不带文字的 `/savvy-start` 只开启并打开侧栏，不调用模型；重复运行会聚焦同一个面板。`/agents-info` 保留用于手动查看或重新打开面板。off 模式仍需先切回 manual 或 auto；若宿主暂时无法打开侧栏，会明确提示重试方式，任务文字不会因此丢失。
 
 **先给计划、等你批准、再派工可以跨多个回合**，普通答复不会自动关闭许可。任务完成后由流程报告 `finished: true`、调用 `workflow_control finish`，或由你点击“结束本次协作”。需要立即停用新派工可切 `off`。不要把仍显示激活的上一任务当成已自动结束。
 

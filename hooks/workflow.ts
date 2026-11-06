@@ -53,7 +53,7 @@ export async function startWorkflow($: EngineInterface, options: Record<string, 
     inputSchema: { type: 'object', additionalProperties: false, properties: { action: { type: 'string', enum: ['status', 'finish'] } }, required: ['action'] },
   })
   await $.command.register({ name: 'savvy-mode', description: 'Session Savvy mode: off | manual | auto. No model call; manual requires /savvy-start for each workflow.' })
-  await $.command.register({ name: 'savvy-start', description: 'Start this workflow; optionally append a task to submit it to the current Claude session.' })
+  await $.command.register({ name: 'savvy-start', description: 'Start this workflow and open its Agents pane; optionally append a task for the current Claude session.' })
   await $.command.register({ name: 'savvy-check', description: 'Check the real workflow/status/catalog tool wire contract without dispatching a worker or calling a model.' })
 }
 export const registerWorkflow: Register = (on) => {
@@ -81,7 +81,14 @@ export const registerWorkflow: Register = (on) => {
     const task = String(event.args ?? '').trim()
     if (task.length > 64_000) return { text: '任务过长；请将详细材料放入项目文件，再提交简短任务。尚未开启协作。' }
     if (!await activateWorkflow($)) return { text: await workflowRefusal($) }
-    if (!task) return { text: '已启用本次 Savvy 协作。manual 模式在流程完成后恢复待机。' }
+    let paneNotice = ''
+    try {
+      const pane = await $.ui.open({ id: 'savvy-agents', title: 'Agents' })
+      if (!pane.isPlaced) paneNotice = '侧栏暂未打开，可用 /agents-info 重试。'
+    } catch {
+      paneNotice = '侧栏暂未打开，可用 /agents-info 重试。'
+    }
+    if (!task) return { text: '已启用本次 Savvy 协作。manual 模式在流程完成后恢复待机。' + paneNotice }
     // Run after command.run returns: awaiting the queued prompt in this handler
     // could block the composer drain that must deliver it. This is a normal
     // prompt in the current session, never another CLI or a wrapper agent.
@@ -103,7 +110,7 @@ export const registerWorkflow: Register = (on) => {
         }
       })()
     })
-    return { text: '已启用本次协作，正在将任务提交给当前 Claude 会话。' }
+    return { text: '已启用本次协作，正在将任务提交给当前 Claude 会话。' + paneNotice }
   })
   on('tool.call', { tool: WORKFLOW_TOOL }, async ($, event) => {
     if (event.agentId) return answer({ status: 'blocked', summary: 'Only the main session may control the workflow.' })

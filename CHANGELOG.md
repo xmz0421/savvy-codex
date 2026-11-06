@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5.0-codex.2
+
+- `/savvy-start [task]` immediately opens/focuses the existing Agents pane, eliminating the second command in normal use. Empty starts open the pane without inference; placement failures remain visible and preserve the task.
+
 ## 1.5.0-codex.1
 
 - Repair registered-tool wire results and native-tool denials, with negative host-contract fixtures and mandatory native Hook CI on Claude Code 2.1.317.

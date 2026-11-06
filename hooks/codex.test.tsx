@@ -44,6 +44,7 @@ function completed(status = 'complete') {
 }
 
 type WorldOptions = {
+  paneUnavailable?: boolean
   gitState?: 'non-git' | 'dirty'
   env?: Record<string, string>
   packet?: object
@@ -88,7 +89,7 @@ function world(on: On, options: WorldOptions = {}) {
     return ok({ tool: `mcp__savvy-codex__${e.name}` })
   })
   on('command.register', (_$, e) => ok({ command: e.name }))
-  on('ui.open', (_$, e) => { opened.push({ id: e.id, title: e.title }); return ok({ isPlaced: true }) })
+  on('ui.open', (_$, e) => { opened.push({ id: e.id, title: e.title }); return ok({ isPlaced: !options.paneUnavailable }) })
   on('ui.copy', (_$, e) => { copied.push(e.text); return ok({ isCopied: true }) })
   on('ui.toast', (_$, e) => { notices.push(e.message ?? e.text); return ok(undefined) })
   on('model.complete', () => { modelCalls++; throw new Error('No models are allowed in UI tests') })
@@ -169,6 +170,7 @@ test('savvy-start forwards a task once after the command returns, without a help
   await $.session.start({ source: 'startup', cwd: ROOT, surface: 'desktop', isInteractive: true } as never)
   const task = '检查测试入口\n保留 `literal` 和 $(literal)，按需要选择两家的 worker。'
   expect(await $.command.run({ command: 'savvy-start', args: task } as never)).toMatchObject({ text: '已启用本次协作，正在将任务提交给当前 Claude 会话。' })
+  expect(w.opened).toEqual([{ id: 'savvy-agents', title: 'Agents' }])
   expect(sent).toEqual([])
   await w.clock.advance(1)
   expect(sent.length).toBe(1)
@@ -185,6 +187,10 @@ test('savvy-start with no task does not submit; off blocks activation and task f
   const sent: string[] = []
   on('prompt.submit', (_$, e) => { sent.push(e.text); return { text: e.text } })
   await start($)
+  expect(w.opened).toEqual([{ id: 'savvy-agents', title: 'Agents' }])
+  await $.command.run({ command: 'savvy-start', args: '' } as never)
+  expect(w.opened).toHaveLength(2)
+  expect(new Set(w.opened.map(pane => pane.id)).size).toBe(1)
   await w.clock.advance(1)
   expect(sent).toEqual([])
   await $.command.run({ command: 'savvy-mode', args: 'off' } as never)
@@ -192,6 +198,20 @@ test('savvy-start with no task does not submit; off blocks activation and task f
   await w.clock.advance(1)
   expect(sent).toEqual([])
   expect(await call($, { tool: 'mcp__savvy-codex__workflow_control', action: 'status' })).toMatchObject({ result: { mode: 'off', allowed: false } })
+})
+
+test('a pane placement failure stays visible without dropping the submitted task', async ($, on) => {
+  const w = world(on, { paneUnavailable: true })
+  const sent: string[] = []
+  on('prompt.submit', (_$, e) => { sent.push(e.text); return { text: e.text } })
+  await $.session.start({ source: 'startup', cwd: ROOT, surface: 'desktop', isInteractive: true } as never)
+  const result = await $.command.run({ command: 'savvy-start', args: '检查项目测试入口' } as never)
+  expect(result.text).toContain('侧栏暂未打开')
+  await w.clock.advance(1)
+  expect(sent.length).toBe(1)
+  expect(sent[0]).toContain('检查项目测试入口')
+  expect(w.runs).toEqual([])
+  expect(w.modelCalls()).toBe(0)
 })
 
 test('a dropped task is visible and consumes the manual activation', async ($, on) => {
@@ -279,7 +299,8 @@ for (const surface of ['desktop', 'terminal'] as const) {
     expect(w.copied).toEqual([REPORT])
     await pane.press({ key: 'codex-back' })
     expect(await pane.find({ key: `codex-file-${ID}-0` })).toBeDefined()
-    expect(w.opened).toHaveLength(1)
+    expect(w.opened).toHaveLength(2)
+    expect(w.opened.every(pane => pane.id === 'savvy-agents')).toBe(true)
     expect(w.runs).toHaveLength(1)
   })
 }
@@ -338,7 +359,7 @@ test('a helper start failure is retained as a blocked launch with no invented ru
   await start($)
   expect(await call($, INPUT)).toMatchObject({ result: { status: 'blocked', summary: expect.stringContaining('process launch denied') } })
   expect(await call($, { tool: CODEX_STATUS })).toMatchObject({ result: { jobs: [{ status: 'blocked', run_dir: '', failure_kind: 'launch_failed' }] } })
-  expect(w.opened).toHaveLength(1)
+  expect(w.opened).toHaveLength(2)
   const pane = await mount($)
   expect(JSON.stringify(await pane.drawn())).toContain('process launch denied')
 })
