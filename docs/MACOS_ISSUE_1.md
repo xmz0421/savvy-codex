@@ -17,6 +17,8 @@
 
 缓存警告例外要求可验证的命令归属和成功状态。未知/非零退出、其他命令、复合 shell 脚本、真实文件权限拒绝或 CLI 汇总 stderr 均不适用；同一输出混有真正拒绝时仍阻止交付。`required_tools` 仍须有成功证据。没有完整事件上下文的旧记录不会被追溯改为成功。
 
+实机 CI 还重现了系统 `/var/folders/<分片>/<用户标识>/T/xcrun_db-*` 路径的同类误判：Apple Git 2.50.1 退出 0，但缓存写入被拒。识别范围覆盖该系统目录结构、`/tmp` 以及对应 `/private` 别名；任意项目目录、路径穿越和其他缓存名仍不适用。
+
 状态中的警告最多保存 20 条，并有 32 KiB 存储预算及单条长度限制，避免重复警告使任务详情无法加载。报告记录总数、缩短或省略数量；原始 JSONL 保持完整。超出展示上限不会使同类缓存行重新被判为权限失败。
 
 Python 解释器记录只从当前 helper 所属插件根目录读取，限制大小并检查安装器身份、schema、状态、插件身份、目的地及绝对解释器路径。显式 `pythonPath`、环境覆盖仍优先；损坏、链接、其他安装或缺失的记录不用来决定运行命令。Homebrew 的解释器路径本身可以是正常系统链接。
@@ -25,6 +27,6 @@ Python 解释器记录只从当前 helper 所属插件根目录读取，限制�
 
 拉取更新后，用已有 Python 3.10+ 的完整路径重新运行 `scripts/install.py`，重开 Claude Desktop Code 会话，再运行 `/savvy-check` 和 `/savvy-start 你的任务`。已有 Python 显式设置若指向 3.9，需要用户自行改为正确解释器；安装器不会覆盖它。
 
-自动检查覆盖 Windows / Ubuntu / macOS 的 Python 3.10、3.12，Ubuntu / macOS 的 Claude Code 2.1.317 原生 Hook，以及真实 Python 3.9 安装拒绝。macOS 专用 smoke 使用系统 Git 和 sandbox-exec，严格限制写入，仅验证平台命令行为，不调用模型。
+自动检查覆盖 Windows / Ubuntu / macOS 的 Python 3.10、3.12，Ubuntu / macOS 的 Claude Code 2.1.317 原生 Hook，以及真实 Python 3.9 安装拒绝。macOS 专用 smoke 使用系统 Git 和 sandbox-exec，禁止普通文件写入，仅允许 Git 启动链重定向使用的精确 `/dev/null` 设备；同时实际尝试创建普通文件并确认被拒。它仅验证平台命令行为，不调用模型，测试 profile 不改变生产沙箱。
 
 issue 原文没有完整的失败 JSONL 命令事件和退出码，回归用例按已报告诊断构造，不能声称完整重放了原任务。CI 无账号，不覆盖报告者 Darwin 27.3.0、应用内 Codex alpha 的登录推理和桌面点击；这些仍需相应机器复验。普通测试通过也不等同于真实模型协作已完成。

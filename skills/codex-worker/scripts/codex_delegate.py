@@ -58,7 +58,8 @@ DENIED = re.compile(
 )
 XCRUN_CACHE_WARNING = re.compile(
     r"(?:git|xcrun): (?:error|warning): couldn't create cache file "
-    r"'/tmp/xcrun_db-[A-Za-z0-9_-]+' \(errno=Operation not permitted\)"
+    r"'(?:/tmp|/private/tmp|/(?:private/)?var/folders/[A-Za-z0-9]{2}/[A-Za-z0-9_-]+/T)"
+    r"/xcrun_db-[A-Za-z0-9_-]+' \(errno=Operation not permitted\)"
 )
 MAX_PLATFORM_WARNINGS = 20
 MAX_PLATFORM_WARNING_BYTES = 32 * 1024

@@ -11,6 +11,7 @@ import codex_delegate as worker
 
 
 CACHE_WARNING = "git: error: couldn't create cache file '/tmp/xcrun_db-AB12_cd' (errno=Operation not permitted)"
+REAL_MAC_WARNING = "git: error: couldn't create cache file '/var/folders/h5/t85nd63d71x27_8gl5gw3l_w0000gn/T/xcrun_db-ztGhW4X8' (errno=Operation not permitted)"
 
 
 class MacCompatibilityTests(unittest.TestCase):
@@ -63,6 +64,47 @@ class MacCompatibilityTests(unittest.TestCase):
             with self.subTest(command=command):
                 output = CACHE_WARNING.replace("git: error:", "xcrun: warning:") + "\n"
                 self.assertEqual(self.assess(self.evidence(self.event(command, output)))["status"], "complete")
+
+    def test_exact_system_cache_paths_including_real_macos_diagnostic(self):
+        paths = ("/tmp/xcrun_db-AB12_cd", "/private/tmp/xcrun_db-AB12_cd",
+                 "/var/folders/h5/t85nd63d71x27_8gl5gw3l_w0000gn/T/xcrun_db-ztGhW4X8",
+                 "/private/var/folders/h5/test_id-123/T/xcrun_db-ztGhW4X8")
+        for path in paths:
+            with self.subTest(path=path):
+                message = CACHE_WARNING.replace("/tmp/xcrun_db-AB12_cd", path)
+                evidence = self.evidence(self.event(output="git version 2.50.1 (Apple Git-155)\n" + message + "\n"))
+                self.assertEqual(self.assess(evidence)["status"], "complete")
+                self.assertEqual(evidence["platform_warnings"][0]["message"], message)
+        self.assertEqual(CACHE_WARNING.replace("/tmp/xcrun_db-AB12_cd", paths[2]), REAL_MAC_WARNING)
+
+    def test_cache_path_variants_do_not_relax_provenance_or_success_requirements(self):
+        for event, system in ((self.event(output=REAL_MAC_WARNING, exit_code=1), "Darwin"),
+                              (self.event(output=REAL_MAC_WARNING, exit_code=None), "Darwin"),
+                              (self.event("python check.py", REAL_MAC_WARNING), "Darwin"),
+                              (self.event(output=REAL_MAC_WARNING), "Linux")):
+            with self.subTest(event=event, system=system):
+                evidence = self.evidence(event, system)
+                self.assertFalse(evidence["platform_warnings"])
+                self.assertEqual(self.assess(evidence)["status"], "blocked")
+        evidence = self.evidence(self.event(output=REAL_MAC_WARNING))
+        self.assertEqual(self.assess(evidence, stderr=REAL_MAC_WARNING)["status"], "blocked")
+        mixed = self.evidence(self.event(output=REAL_MAC_WARNING + "\nPermission denied: private.txt"))
+        self.assertEqual(self.assess(mixed)["status"], "blocked")
+
+    def test_other_directories_and_noncanonical_cache_paths_still_block(self):
+        for path in ("/project/tmp/xcrun_db-token", "/Users/test/tmp/xcrun_db-token",
+                     "/tmp/nested/xcrun_db-token", "/private/tmp/../tmp/xcrun_db-token",
+                     "/var/folders/h/id/T/xcrun_db-token", "/var/folders/h55/id/T/xcrun_db-token",
+                     "/var/folders/../id/T/xcrun_db-token", "/var/folders/h5/../T/xcrun_db-token",
+                     "/var/folders/h5/.hidden/T/xcrun_db-token", "/var/folders/h5/id/t/xcrun_db-token",
+                     "/var/folders/h5/id/C/xcrun_db-token", "/var/folders/h5/id/T/nested/xcrun_db-token",
+                     "/private/var/folders/h5/id/T/../T/xcrun_db-token",
+                     "/var/folders/h5/id/T/xcrun_db-token.log", "/var/folders/h5/id/T/xcrun_db-"):
+            with self.subTest(path=path):
+                message = CACHE_WARNING.replace("/tmp/xcrun_db-AB12_cd", path)
+                evidence = self.evidence(self.event(output=message))
+                self.assertFalse(evidence["platform_warnings"])
+                self.assertEqual(self.assess(evidence)["status"], "blocked")
 
     def test_unknown_or_compound_command_never_receives_cache_exception(self):
         for command in (None, "python check.py", "/other/git --version", "env git --version",
