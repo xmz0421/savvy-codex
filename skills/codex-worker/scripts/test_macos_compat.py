@@ -256,7 +256,9 @@ class MacCompatibilityTests(unittest.TestCase):
         # This checks an actual system command without invoking Codex or a
         # model. An already warm xcrun cache may produce no cache warning.
         self.assertTrue(Path("/usr/bin/sandbox-exec").is_file(), "macOS smoke requires the system sandbox-exec executable")
-        profile = "(version 1)(allow default)(deny file-write*)"
+        # Apple's Git shim redirects xcodebuild diagnostics to this device.
+        # Permit that exact sink while retaining the ordinary-file write deny.
+        profile = '(version 1)(allow default)(deny file-write*)(allow file-write* (literal "/dev/null"))'
         result = subprocess.run(["/usr/bin/sandbox-exec", "-p", profile, "/usr/bin/git", "--version"],
                                 capture_output=True, text=True, timeout=30, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
