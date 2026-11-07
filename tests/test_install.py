@@ -20,7 +20,10 @@ class InstallerTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        # macOS exposes its temporary directory through /var -> /private/var.
+        # Canonicalize this controlled fixture, while production still rejects
+        # caller-supplied links and junctions in source/destination paths.
+        self.root = Path(self.temporary.name).resolve()
         self.source = self.root / "checkout"
         self.home = self.root / "home"
         self.home.mkdir()
@@ -99,6 +102,44 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue(result["ready"])
         self.assertEqual(result["status"], "ready")
         self.assertTrue(result["doctor"]["checks"]["official_cli"]["ok"])
+
+    def test_old_python_cannot_bypass_install_guard_or_inspect_paths(self):
+        self.home.rmdir()
+        for skip_doctor in (False, True):
+            with self.subTest(skip_doctor=skip_doctor), \
+                 mock.patch.object(INSTALLER.sys, "version_info", (3, 9, 6)), \
+                 mock.patch.object(INSTALLER, "absolute") as absolute, \
+                 mock.patch.object(INSTALLER, "doctor_preflight") as doctor:
+                with self.assertRaisesRegex(INSTALLER.NotReadyError, r"running Python 3\.9\.6.*absolute path.*3\.10\+"):
+                    self.run_install(skip_doctor=skip_doctor)
+                absolute.assert_not_called()
+                doctor.assert_not_called()
+                self.assertFalse(self.home.exists())
+
+    def test_old_python_cli_guard_preserves_existing_install(self):
+        self.run_install()
+        before = self.snapshot()
+        for extra in ([], ["--skip-doctor"]):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with self.subTest(extra=extra), \
+                 mock.patch.object(INSTALLER.sys, "version_info", (3, 9, 6)), \
+                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = INSTALLER.main(["--source", str(self.source), "--claude-home", str(self.home), *extra])
+            self.assertEqual(code, 2)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("running Python 3.9.6", stderr.getvalue())
+            self.assertIn("absolute path", stderr.getvalue())
+            self.assertEqual(before, self.snapshot())
+
+    def test_old_python_still_supports_help_and_uninstall(self):
+        self.run_install()
+        with mock.patch.object(INSTALLER.sys, "version_info", (3, 9, 6)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as help_exit:
+                INSTALLER.main(["--help"])
+            self.assertEqual(help_exit.exception.code, 0)
+            self.assertEqual(INSTALLER.main(["--claude-home", str(self.home), "--uninstall"]), 0)
+        self.assertFalse(self.destination.exists())
 
     def test_doctor_failure_has_no_install_or_global_mutations(self):
         self.write_settings({"env": {"keep": "secret"}, "enabledPlugins": {"original": True}})
@@ -369,6 +410,20 @@ class InstallerTests(unittest.TestCase):
             INSTALLER.uninstall(self.home)
         self.assertTrue(self.destination.exists())
         self.assertEqual(list(outside.iterdir()), [])
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS system aliases")
+    def test_macos_system_aliases_require_canonical_caller_paths(self):
+        for parent in ("/tmp", "/var/tmp"):
+            with self.subTest(parent=parent), tempfile.TemporaryDirectory(dir=parent) as temporary:
+                aliased_root = Path(temporary)
+                canonical_root = aliased_root.resolve()
+                self.assertNotEqual(aliased_root, canonical_root)
+                # Production must not silently resolve even a system alias.
+                with self.assertRaisesRegex(ValueError, "symlink or junction"):
+                    INSTALLER.install(self.source, aliased_root / "home", skip_doctor=True)
+                self.assertFalse((canonical_root / "home").exists())
+                installed = INSTALLER.install(self.source, canonical_root / "home", skip_doctor=True)
+                self.assertTrue(Path(installed["destination"]).is_dir())
 
     def assert_live_snapshot(self, expected):
         actual = {key: value for key, value in self.snapshot().items()

@@ -140,18 +140,51 @@ async function readJson($: EngineInterface, path: string, root: string, maxBytes
 async function home($: EngineInterface): Promise<string> {
   return absolutePath((await $.env.get('USERPROFILE')) || (await $.env.get('HOME')) || '')
 }
+
+async function installedPython($: EngineInterface, root: string): Promise<string> {
+  try {
+    // Read only this plugin's installer receipt, never account settings. The
+    // bounded reader rejects linked receipt files and linked parent directories.
+    const receipt = await readJson($, `${root.replace(/\/$/, '')}/.install-info.json`, root, 64 * 1024)
+    if (receipt.owner !== 'savvy-codex-installer' || receipt.schema_version !== 2 || receipt.status !== 'installed' ||
+      receipt.plugin_identity !== 'savvy-codex@skills-dir' || typeof receipt.destination !== 'string' ||
+      receipt.destination !== receipt.destination.trim() || /[\u0000-\u001f\u007f]/.test(receipt.destination) ||
+      !samePath(absolutePath(receipt.destination), root)) return ''
+    const python = receipt.installer_python
+    // Do not sanitize malformed metadata into a valid executable. A real Python
+    // path may contain spaces or Homebrew symlinks; it remains one argv element.
+    if (typeof python !== 'string' || python !== python.trim() || /[\u0000-\u001f\u007f]/.test(python)) return ''
+    return absolutePath(python)
+  } catch {
+    // Source/marketplace packages and old installs may have no managed receipt.
+    return ''
+  }
+}
 // Register's options are the host's userConfig values. Keep argv elements
 // separate: paths with spaces are executable paths, never shell fragments.
 export async function workerCommand($: EngineInterface, options: WorkerOptions = workerOptions): Promise<string[]> {
-  const python = string(options.pythonPath) || string(await $.env.get('SAVVY_CODEX_PYTHON')) ||
-    ((await $.env.get('OS')) === 'Windows_NT' ? 'python' : 'python3')
-  if (/[\u0000-\u001f\u007f]/.test(python)) throw new Error('pythonPath 包含无效字符。')
+  const explicitPython = string(options.pythonPath) || string(await $.env.get('SAVVY_CODEX_PYTHON'))
+  if (/[\u0000-\u001f\u007f]/.test(explicitPython)) throw new Error('pythonPath 包含无效字符。')
+  const fallbackPython = (await $.env.get('OS')) === 'Windows_NT' ? 'python' : 'python3'
   const explicitHelper = string(options.helperPath) || string(await $.env.get('SAVVY_CODEX_HELPER'))
-  if (explicitHelper) return [python, absolutePath(explicitHelper)]
+  const helper = explicitHelper ? absolutePath(explicitHelper) : ''
+  if (helper && explicitPython) return [explicitPython, helper]
   const configuredRoot = string(options.pluginRoot) || string(await $.env.get('SAVVY_CODEX_PLUGIN_ROOT')) ||
     string(await $.env.get('CLAUDE_PLUGIN_ROOT'))
-  const root = configuredRoot ? absolutePath(configuredRoot) : `${await home($)}/.claude/skills/savvy-codex`
-  return [python, `${root.replace(/\/$/, '')}/skills/codex-worker/scripts/codex_delegate.py`]
+  // A standalone helper override historically does not need HOME/pluginRoot.
+  // Without either, there is no authorized install root from which to read.
+  if (helper && !configuredRoot && !(await $.env.get('USERPROFILE')) && !(await $.env.get('HOME'))) return [fallbackPython, helper]
+  let root: string
+  try {
+    root = configuredRoot ? absolutePath(configuredRoot) : `${await home($)}/.claude/skills/savvy-codex`
+  } catch (error) {
+    if (helper) return [fallbackPython, helper]
+    throw error
+  }
+  const installedHelper = `${root.replace(/\/$/, '')}/skills/codex-worker/scripts/codex_delegate.py`
+  // Never borrow another installation's interpreter for an unrelated helper.
+  const python = explicitPython || ((!helper || samePath(helper, installedHelper)) ? await installedPython($, root) : '') || fallbackPython
+  return [python, helper || installedHelper]
 }
 async function runRoot($: EngineInterface): Promise<string> {
   return `${await home($)}/.claude/codex-worker-runs`
@@ -165,6 +198,9 @@ export function normalizeStatus(value: unknown): CodexStatus {
   return [...ACTIVE, ...TERMINAL].includes(raw as CodexStatus) ? raw as CodexStatus : 'unknown'
 }
 export const isActive = (job: CodexJob): boolean => ACTIVE.includes(job.status)
+
+const platformWarnings = (value: unknown): string[] => Array.isArray(value) ? value.slice(0, 20)
+  .map(warning => cleanText(typeof warning === 'string' ? warning : dict(warning).message, 1200)).filter(Boolean) : []
 
 function resultOf(value: unknown): CodexResult | undefined {
   const raw = dict(value)
@@ -255,6 +291,8 @@ export function mergeState(previous: CodexJob, raw: Dict): CodexJob {
     finishedAt: cleanText(raw.finished_at || previous.finishedAt, 100),
     updatedAt: cleanText(raw.updated_at || previous.updatedAt, 100),
     summary: cleanText(raw.summary || result?.summary || previous.summary, 12_000),
+    platformWarnings: raw.platform_warnings === undefined && dict(raw.result).platform_warnings === undefined ? previous.platformWarnings ?? [] :
+      platformWarnings(raw.platform_warnings ?? dict(raw.result).platform_warnings),
     lastTool: cleanText(tool || previous.lastTool, 180),
     lastMessage: cleanText(raw.last_message || progress.note || previous.lastMessage, 1800),
     changedFiles: strings(raw.changed_files ?? result?.changed_files ?? previous.changedFiles),
@@ -331,6 +369,7 @@ function toolSummary(job: CodexJob, extra: Dict = {}): Dict {
     report_path: job.reportPath,
     result_path: job.resultPath,
     summary: job.summary,
+    platform_warnings: job.platformWarnings ?? [],
     changed_files: job.changedFiles,
     kind: job.kind || '', review_of: job.reviewOf || '', parent_job: job.parentJob || '', author_provider: job.authorProvider || '',
     attempt: job.attempt, failure_kind: job.failureKind || '', next_action: job.nextAction || '', retryable: job.retryable,
@@ -701,6 +740,7 @@ export async function renderCodex($: EngineInterface, event: Parameters<EngineIn
       <Text>最近工具：{current.lastTool || '未知：执行器未提供工具活动。'}</Text>
       {current.lastMessage && <Text>活动：{current.lastMessage}</Text>}
       {current.summary && <Text>{current.summary}</Text>}
+      {current.platformWarnings?.map((warning, index) => <Text key={`platform-warning-${index}`}>平台提示：{warning}</Text>)}
       {current.readError && <Text>{current.readError}</Text>}
       {current.isolationNotice && <Text>{current.isolationNotice}</Text>}
       {current.executionWorkspace && <Text>执行目录：{current.executionWorkspace}</Text>}

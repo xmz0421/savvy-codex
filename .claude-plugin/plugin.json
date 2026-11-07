@@ -1,6 +1,6 @@
 {
   "name": "savvy-codex",
-  "version": "1.5.0-codex.2",
+  "version": "1.5.1-codex.1",
   "description": "Savvy orchestration with Claude and subscription-authenticated Codex workers in the same native Agents panel.",
   "author": {
     "name": "xmz0421 (based on johnnyvizz/claude-kit)",
@@ -34,7 +34,7 @@
     "pythonPath": {
       "type": "string",
       "title": "Python executable",
-      "description": "Python 3.10+ executable path or name; blank uses SAVVY_CODEX_PYTHON, then platform default.",
+      "description": "Python 3.10+ executable path or name; blank uses SAVVY_CODEX_PYTHON, a verified installer receipt, then platform default.",
       "default": ""
     },
     "pluginRoot": {

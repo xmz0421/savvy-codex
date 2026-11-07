@@ -13,10 +13,12 @@ import datetime as dt
 import hashlib
 import json
 import os
+import platform
 import queue
 from pathlib import Path
 import re
 import shutil
+import shlex
 import signal
 import subprocess
 import sys
@@ -54,6 +56,12 @@ DENIED = re.compile(
     r"(?:denied|rejected|blocked)[^\n]{0,60}(?:approval|permission|sandbox|tool)",
     re.IGNORECASE,
 )
+XCRUN_CACHE_WARNING = re.compile(
+    r"(?:git|xcrun): (?:error|warning): couldn't create cache file "
+    r"'/tmp/xcrun_db-[A-Za-z0-9_-]+' \(errno=Operation not permitted\)"
+)
+MAX_PLATFORM_WARNINGS = 20
+MAX_PLATFORM_WARNING_BYTES = 32 * 1024
 
 
 class WorkerError(Exception):
@@ -212,6 +220,27 @@ def child_environment(environ=None, proxies=None):
     return env
 
 
+def macos_cli_candidates():
+    relative = Path("ChatGPT.app/Contents/Resources/codex-cli/bin/codex")
+    return [Path("/Applications") / relative, Path.home() / "Applications" / relative]
+
+
+def discover_macos_cli():
+    """Use a desktop bundle only when PATH discovery found no CLI entry."""
+    candidates = macos_cli_candidates()
+    invalid = []
+    for candidate in candidates:
+        if candidate.is_file() and not candidate.is_symlink() and os.access(candidate, os.X_OK):
+            return [str(candidate.resolve())]
+        if candidate.exists() or candidate.is_symlink():
+            invalid.append(str(candidate))
+    if invalid:
+        raise WorkerError("ChatGPT-bundled Codex CLI candidate is not a regular executable file: "
+                          + ", ".join(invalid) + ". Repair the app or install the official CLI on PATH.", "unsupported_cli")
+    raise WorkerError("Official Codex CLI was not found on PATH or in ChatGPT.app; checked: "
+                      + ", ".join(str(candidate) for candidate in candidates) + ". Install/sign in separately.", "unsupported_cli")
+
+
 def discover_cli():
     """Honor the user's PATH entry; never execute .cmd/.ps1 through a shell.
 
@@ -224,6 +253,8 @@ def discover_cli():
     if not shim:
         if native:
             return [str(Path(native).resolve())]
+        if platform.system() == "Darwin":
+            return discover_macos_cli()
         raise WorkerError("Official Codex CLI was not found on PATH; install/sign in separately.")
     path = Path(shim).resolve()
     if path.suffix.lower() == ".exe":
@@ -848,6 +879,9 @@ def build_prompt(packet, scopes, permission):
         "place pytest cache and other test artifacts under SAVVY_VERIFICATION_OUTPUT_DIR as well (for example pytest -o cache_dir=<output>/.pytest_cache). "
         "Without such a directory, writing test temporary files is not authorized: choose a check without file outputs or report this exact limitation as blocked. "
         "Your cwd is an independent allowlist snapshot of the current authorized inputs. "
+        "It is not a Git working tree; the controller owns Git metadata and patch creation. "
+        "Do not run git status/diff or discover a repository/baseline above this snapshot. "
+        "If repository history is necessary, ask the lead to supply it as context. "
         "All work and checks must use this snapshot. Do not locate, read or write the original source workspace, "
         "parent runtime directories, private baseline repository or system credentials. "
         "You may execute the configured existing language runtimes and their installed standard dependencies; "
@@ -932,8 +966,75 @@ def canonical_tool(name):
     return value
 
 
+def is_macos_cache_command(command):
+    """Recognize a single git/xcrun command, including a CLI shell wrapper.
+
+    Compound shell scripts and unknown wrappers have no reliable provenance.
+    This parser only classifies observed output; it never executes the text.
+    """
+    if not isinstance(command, str) or any(value in command for value in ("\n", "\r", "`", "$(")):
+        return False
+    def words(value):
+        lexer = shlex.shlex(value, posix=True, punctuation_chars=";&|<>()")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
+    try:
+        tokens = words(command)
+        if len(tokens) == 3 and tokens[0] in {"sh", "bash", "zsh", "/bin/sh", "/bin/bash", "/bin/zsh"} and tokens[1] in {"-c", "-lc"}:
+            tokens = words(tokens[2])
+        if not tokens or tokens[0] not in {"git", "xcrun", "/usr/bin/git", "/usr/bin/xcrun"}:
+            return False
+        # Reject script operators even when attached to an argument. Quoted
+        # operators are conservatively rejected as well.
+        return not any(token and all(char in ";&|<>()" for char in token) for token in tokens)
+    except ValueError:
+        return False
+
+
+def record_platform_warning(evidence, command, message):
+    """Bound state/report metadata while leaving the source JSONL unchanged."""
+    evidence["platform_warnings_total"] += 1
+    warning = {"kind": "xcrun_cache", "command": command[:2000],
+               "message": message[:1200], "exit_code": 0}
+    # A byte budget also bounds multibyte arguments and JSON escaping. Reserve
+    # extra bytes per object for the indentation of nested state/result fields.
+    size = len(json.dumps(warning, ensure_ascii=False).encode("utf-8")) + 128
+    if (len(evidence["platform_warnings"]) >= MAX_PLATFORM_WARNINGS
+            or evidence["platform_warning_bytes"] + size > MAX_PLATFORM_WARNING_BYTES):
+        evidence["platform_warnings_truncated"] += 1
+        evidence["platform_warnings_omitted"] += 1
+        return
+    evidence["platform_warning_bytes"] += size
+    evidence["platform_warnings"].append(warning)
+    if warning["command"] != command or warning["message"] != message:
+        evidence["platform_warnings_truncated"] += 1
+
+
+def classify_platform_output(item, output, successful, evidence):
+    """Exempt only precise Darwin cache diagnostics from successful git/xcrun.
+
+    No permission, sandbox or temporary-directory setting is changed. CLI
+    stderr lacks command provenance and is deliberately never passed here.
+    """
+    if (platform.system() != "Darwin" or not successful
+            or type(item.get("exit_code")) is not int or item["exit_code"] != 0 or item.get("error")
+            or not is_macos_cache_command(item.get("command"))):
+        return output
+    kept = []
+    for line in output.splitlines(keepends=True):
+        message = line.rstrip("\r\n")
+        if XCRUN_CACHE_WARNING.fullmatch(message):
+            record_platform_warning(evidence, item["command"], message)
+        else:
+            kept.append(line)
+    return "".join(kept)
+
+
 def event_evidence(path):
-    evidence = {"successful_tools": set(), "file_changes": set(), "denials": [], "errors": [], "invalid_lines": 0, "last_message": None, "last_tool": None}
+    evidence = {"successful_tools": set(), "file_changes": set(), "denials": [], "errors": [], "invalid_lines": 0, "last_message": None, "last_tool": None,
+                "platform_warnings": [], "platform_warnings_total": 0, "platform_warnings_truncated": 0,
+                "platform_warnings_omitted": 0, "platform_warning_bytes": 0}
     if not Path(path).exists():
         return evidence
     with Path(path).open(encoding="utf-8-sig", errors="replace") as stream:
@@ -962,14 +1063,16 @@ def event_evidence(path):
             if item_type in {"command_execution", "file_change", "mcp_tool_call", "tool_call"} or item.get("tool"):
                 evidence["last_tool"] = canonical_tool(tool_name)
             output = str(item.get("aggregated_output") or item.get("output") or item.get("error") or "")
+            successful = completed and item.get("status", "completed") in {"completed", "success", "succeeded"}
+            if canonical_tool(tool_name) == "exec_command":
+                successful = (successful and item.get("exit_code") == 0 and not item.get("error")
+                              and not (isinstance(item.get("result"), dict) and item["result"].get("isError")))
+                output = classify_platform_output(item, output, successful, evidence)
+            else:
+                successful = successful and not item.get("error") and not (isinstance(item.get("result"), dict) and item["result"].get("isError"))
             denied = DENIED.search(output)
             if denied:
                 evidence["denials"].append(denied.group(0)[:200])
-            successful = completed and item.get("status", "completed") in {"completed", "success", "succeeded"}
-            if canonical_tool(tool_name) == "exec_command":
-                successful = successful and item.get("exit_code") == 0
-            else:
-                successful = successful and not item.get("error") and not (isinstance(item.get("result"), dict) and item["result"].get("isError"))
             if successful and not denied and item_type not in {"agent_message", "reasoning", "todo_list", "error", "warning"}:
                 evidence["successful_tools"].add(canonical_tool(tool_name))
             if item_type in {"file_change", "patch_apply_end"}:
@@ -1032,6 +1135,8 @@ def assess_result(response, evidence, packet, workspace, scopes, permission, ret
         response["status"] = "blocked"
         response["limitations"] = list(dict.fromkeys(response["limitations"] + problems))
     response.update(failure_fields("\n".join([response["summary"], *response["limitations"], stderr])) if response["status"] == "blocked" else clear_failure())
+    for name in ("platform_warnings", "platform_warnings_total", "platform_warnings_truncated", "platform_warnings_omitted"):
+        response[name] = evidence.get(name, [] if name == "platform_warnings" else 0)
     return response
 
 
@@ -1050,6 +1155,14 @@ def write_report(state, result):
         if result[name]:
             lines += ["## " + name.replace("_", " ").capitalize(), ""]
             lines += ["- " + value for value in result[name]] + [""]
+    if result.get("platform_warnings"):
+        lines += ["## Platform warnings", ""]
+        for warning in result["platform_warnings"]:
+            lines += ["- " + warning["message"] + " (successful command: " + warning["command"] + ")"]
+        lines += [""]
+    if result.get("platform_warnings_truncated"):
+        lines += [f"Platform warning details shortened or omitted: {result['platform_warnings_truncated']} of {result['platform_warnings_total']}. "
+                  "Complete original output remains in the events JSONL artifact.", ""]
     lines += ["## Artifacts", ""] + [f"- {key}: {value}" for key, value in state["artifacts"].items()]
     Path(state["artifacts"]["report"]).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -1061,6 +1174,9 @@ def metadata_fields():
 def attach_result_metadata(state, result):
     for field in ("failure_kind", "next_action", "retryable"):
         state[field] = result.get(field)
+    for name in ("platform_warnings", "platform_warnings_total", "platform_warnings_truncated", "platform_warnings_omitted"):
+        state[name] = state.get(name, result.get(name, [] if name == "platform_warnings" else 0))
+        result[name] = state[name]
     result.update({key: state.get(key) for key in metadata_fields()})
     result["artifacts"] = state["artifacts"]
 
@@ -1186,6 +1302,8 @@ def run_task(args):
             state["cli_exit_code"] = returncode
             evidence = event_evidence(artifacts["events"])
             state["observed_tools"] = sorted(evidence["successful_tools"])
+            for name in ("platform_warnings", "platform_warnings_total", "platform_warnings_truncated", "platform_warnings_omitted"):
+                state[name] = evidence[name]
             state.update(last_tool=evidence["last_tool"], last_message=evidence["last_message"])
             try:
                 response = read_json(artifacts["model_response"])

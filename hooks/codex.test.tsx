@@ -19,6 +19,7 @@ const STATE = `${RUN}/state.json`
 const REPORT = `${RUN}/report.md`
 const FINAL = `${RUN}/final.json`
 const HELPER = `${HOME}/.claude/skills/savvy-codex/skills/codex-worker/scripts/codex_delegate.py`
+const INSTALL_ROOT = `${HOME}/.claude/skills/savvy-codex`
 const MODEL = 'gpt-6.1-sol'
 const GOAL = '检查边界条件'
 const REASON = '范围明确的只读检查，使用 Sol 与 medium。'
@@ -55,6 +56,8 @@ type WorldOptions = {
   missingState?: boolean
   waitStates?: object[]
   waitDelays?: number[]
+  expectedPython?: string
+  expectedHelper?: string
 }
 
 function world(on: On, options: WorldOptions = {}) {
@@ -67,6 +70,9 @@ function world(on: On, options: WorldOptions = {}) {
     [REPORT]: '# Codex worker report\n\n已核对。\n',
     [FINAL]: JSON.stringify(completed().result),
     [`${ROOT}/src/checked.ts`]: 'export const checked = true\n',
+    // This suite models an unmanaged source package by default. Supply a benign
+    // receipt fixture so optional discovery never throws inside mock handlers.
+    [`${INSTALL_ROOT}/.install-info.json`]: '{}',
   }
   if (options.missingState) delete files[STATE]
   const runs: { argv: string[]; cwd?: string; timeoutMs?: number }[] = []
@@ -110,7 +116,7 @@ function world(on: On, options: WorldOptions = {}) {
     const argv = [...e.argv]
     if (argv[0] === 'git' && options.gitState) return ok({ exitCode: options.gitState === 'non-git' ? 128 : 0, stdout: argv[1] === 'status' ? ' M input.ts\n' : 'fixture-head', stderr: '' })
     runs.push({ argv, cwd: e.init?.cwd, timeoutMs: e.init?.timeoutMs })
-    if (argv[0] !== PYTHON || argv[1] !== HELPER) throw new Error('Unexpected executable in a mocked test')
+    if (argv[0] !== (options.expectedPython ?? PYTHON) || argv[1] !== (options.expectedHelper ?? HELPER)) throw new Error('Unexpected executable in a mocked test')
     const response = (data: object, exitCode = 0) => ok({ exitCode, stdout: JSON.stringify(data), stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
     if (argv[2] === 'start') {
       if (options.startError) return ok({ exitCode: 1, stdout: '', stderr: options.startError, isStdoutTruncated: false, isStderrTruncated: false })
@@ -254,6 +260,127 @@ test('Unix default uses python3 and helper overrides take precedence over plugin
   expect(await workerCommand($, { helperPath: '/settings/helper.py' })).toEqual(['python3', '/settings/helper.py'])
 })
 
+const MAC_ROOT = '/Users/Test/.claude/skills/savvy-codex'
+const MAC_RECEIPT = `${MAC_ROOT}/.install-info.json`
+const MAC_HELPER = `${MAC_ROOT}/skills/codex-worker/scripts/codex_delegate.py`
+const MAC_PYTHON = '/Library/Frameworks/Python Framework/Versions/3.12/bin/python3.12'
+const macEnv = { OS: 'Darwin', USERPROFILE: '', HOME: '/Users/Test', CLAUDE_PLUGIN_ROOT: MAC_ROOT }
+const installReceipt = (overrides: Record<string, unknown> = {}) => ({
+  owner: 'savvy-codex-installer', schema_version: 2, status: 'installed',
+  plugin_identity: 'savvy-codex@skills-dir', destination: MAC_ROOT, installer_python: MAC_PYTHON, ...overrides,
+})
+
+// The testing Engine dispatches events; it is not a hook EngineInterface with
+// env/fs methods. Use the same stat/read contract for these direct unit calls.
+function receiptEnvironment(env: Record<string, string> = macEnv) {
+  const files: Record<string, string> = {}
+  const reads: string[] = []
+  const links = new Set<string>()
+  const sizes: Record<string, number> = {}
+  const $ = {
+    env: { get: async (key: string) => env[key] },
+    fs: {
+      stat: async (path: string) => {
+        const file = files[path]
+        if (file !== undefined) return { kind: 'file', size: sizes[path] ?? new TextEncoder().encode(file).length, isLink: links.has(path) }
+        if (Object.keys(files).some(candidate => within(path, candidate))) return { kind: 'dir', size: 0, isLink: links.has(path) }
+        throw new Error(`ENOENT ${path}`)
+      },
+      read: async (path: string) => {
+        reads.push(path)
+        if (!(path in files)) throw new Error(`ENOENT ${path}`)
+        return files[path]
+      },
+    },
+  } as unknown as EngineInterface
+  return { $, files, reads, links, sizes }
+}
+
+test('native catalog invocation uses the Mac installation interpreter and reads only its receipt', async ($, on) => {
+  // fs event paths follow the actual test host; Darwin interpreter selection
+  // remains simulated so this integration also runs on Windows native hosts.
+  const receipt = `${INSTALL_ROOT}/.install-info.json`
+  const w = world(on, { env: { OS: 'Darwin', CLAUDE_PLUGIN_ROOT: INSTALL_ROOT }, expectedPython: MAC_PYTHON })
+  w.files[receipt] = JSON.stringify(installReceipt({ destination: INSTALL_ROOT }))
+  await start($)
+  expect(await call($, { tool: 'mcp__savvy-codex__codex_catalog' })).toMatchObject({ result: { status: 'ready' } })
+  expect(w.runs[0]?.argv).toEqual([MAC_PYTHON, HELPER, 'catalog', '--cached'])
+  expect(w.reads).toEqual([receipt])
+  expect(w.modelCalls()).toBe(0)
+})
+
+test('Mac uses the current install receipt Python 3.12 as one executable argument', async () => {
+  const w = receiptEnvironment()
+  const $ = w.$
+  w.files[MAC_RECEIPT] = JSON.stringify(installReceipt())
+  expect(await workerCommand($, {})).toEqual([MAC_PYTHON, MAC_HELPER])
+  expect(w.reads).toEqual([MAC_RECEIPT])
+  // Homebrew's executable may be a symlink; only receipt paths are inspected.
+  const homebrew = '/opt/homebrew/bin/python3.12'
+  w.links.add(homebrew)
+  w.files[MAC_RECEIPT] = JSON.stringify(installReceipt({ installer_python: homebrew }))
+  expect(await workerCommand($, {})).toEqual([homebrew, MAC_HELPER])
+})
+
+test('explicit Python config and environment outrank receipts without reading them', async () => {
+  const w = receiptEnvironment({ ...macEnv, SAVVY_CODEX_PYTHON: '/env Python/python3.13' })
+  const $ = w.$
+  w.files[MAC_RECEIPT] = JSON.stringify(installReceipt())
+  expect(await workerCommand($, { pythonPath: '/custom Python/python3.14' })).toEqual(['/custom Python/python3.14', MAC_HELPER])
+  expect(await workerCommand($, {})).toEqual(['/env Python/python3.13', MAC_HELPER])
+  expect(w.reads).toEqual([])
+})
+
+test('helper overrides use receipts only when they belong to the selected plugin root', async () => {
+  const w = receiptEnvironment()
+  const $ = w.$
+  w.files[MAC_RECEIPT] = JSON.stringify(installReceipt())
+  expect(await workerCommand($, { helperPath: '/other/plugin/helper.py' })).toEqual(['python3', '/other/plugin/helper.py'])
+  expect(await workerCommand($, { helperPath: '/other/plugin/helper.py', pluginRoot: 'unused-relative-root' })).toEqual(['python3', '/other/plugin/helper.py'])
+  expect(w.reads).toEqual([])
+  expect(await workerCommand($, { helperPath: MAC_HELPER })).toEqual([MAC_PYTHON, MAC_HELPER])
+  expect(w.reads).toEqual([MAC_RECEIPT])
+})
+
+test('unmanaged, invalid, foreign and relative receipt paths safely retain python3', async () => {
+  const w = receiptEnvironment()
+  const $ = w.$
+  expect(await workerCommand($, {})).toEqual(['python3', MAC_HELPER])
+  for (const content of [
+    '{}', '{invalid json', '[]', 'null',
+    JSON.stringify(installReceipt({ owner: 'other-installer' })),
+    JSON.stringify(installReceipt({ schema_version: 1 })),
+    JSON.stringify(installReceipt({ status: 'uninstalled' })),
+    JSON.stringify(installReceipt({ plugin_identity: 'other@skills-dir' })),
+    JSON.stringify(installReceipt({ destination: '/other/plugin' })),
+    JSON.stringify(installReceipt({ destination: './savvy-codex' })),
+    JSON.stringify(installReceipt({ destination: `\n${MAC_ROOT}` })),
+    JSON.stringify(installReceipt({ installer_python: 'python3.12' })),
+    JSON.stringify(installReceipt({ installer_python: 'py -3' })),
+    JSON.stringify(installReceipt({ installer_python: '/python\n3.12' })),
+    JSON.stringify(installReceipt({ installer_python: '\n/opt/python3.12' })),
+    JSON.stringify(installReceipt({ installer_python: 312 })),
+  ]) {
+    w.files[MAC_RECEIPT] = content
+    expect(await workerCommand($, {})).toEqual(['python3', MAC_HELPER])
+  }
+  expect(w.reads.every(path => path === MAC_RECEIPT)).toBe(true)
+})
+
+test('linked and oversized installation receipts fall back before any content read', async () => {
+  const w = receiptEnvironment()
+  const $ = w.$
+  w.files[MAC_RECEIPT] = JSON.stringify(installReceipt())
+  for (const link of ['/Users', MAC_ROOT, MAC_RECEIPT]) {
+    w.links.add(link)
+    expect(await workerCommand($, {})).toEqual(['python3', MAC_HELPER])
+    w.links.delete(link)
+  }
+  w.sizes[MAC_RECEIPT] = 64 * 1024 + 1
+  expect(await workerCommand($, {})).toEqual(['python3', MAC_HELPER])
+  expect(w.reads).toEqual([])
+})
+
 test('startup registers native tools; an idle clock never starts a process or model', async ($, on) => {
   const w = world(on)
   await start($)
@@ -312,6 +439,29 @@ test('default delegate waits once in the helper and returns the concrete worker 
   expect(w.runs.map(run => run.argv[2])).toEqual(['start', 'wait'])
   expect(w.runs[1]?.argv).toEqual([PYTHON, HELPER, 'wait', '--run-dir', RUN, '--timeout', '45'])
   expect(w.runs[1]?.timeoutMs).toBeLessThanOrEqual(60_000)
+  expect(w.modelCalls()).toBe(0)
+})
+
+test('completed work retains bounded platform warnings in tool results and detail without failing', async ($, on) => {
+  const message = 'xcrun cache warning; Codex completed successfully.'
+  const finished = completed()
+  const warning = { kind: 'xcrun_cache', command: 'xcrun', message, exit_code: 0 }
+  const w = world(on, { wait: { ...finished, result: { ...finished.result, platform_warnings: [warning] } } })
+  await start($)
+  const response = await call($, { ...INPUT, background: false })
+  expect(response).toMatchObject({ result: { status: 'complete', platform_warnings: [message], result: { limitations: [] } } })
+  const pane = await mount($)
+  await pane.press({ key: `codex-row-${ID}` })
+  const drawn = JSON.stringify(await pane.drawn())
+  expect(drawn).toContain('平台提示：')
+  expect(drawn).toContain(message)
+  w.files[STATE] = JSON.stringify({ ...finished, platform_warnings: Array.from({ length: 25 }, () => ({ ...warning, message: `safe\u0000${'x'.repeat(1400)}` })) })
+  const status = await call($, { tool: CODEX_STATUS, job_id: ID })
+  const warnings = (status.result as { platform_warnings: string[] }).platform_warnings
+  expect(warnings).toHaveLength(20)
+  expect(warnings[0]?.length).toBe(1200)
+  expect(warnings[0]).not.toContain('\u0000')
+  expect(status).toMatchObject({ result: { status: 'complete', result: { limitations: [] } } })
   expect(w.modelCalls()).toBe(0)
 })
 

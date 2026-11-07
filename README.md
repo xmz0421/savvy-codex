@@ -32,7 +32,7 @@ echo '{"workflowMode":"manual"}' | claude plugin configure savvy-codex@skills-di
 
 ## 安装和前置检查
 
-需要 Git、Python 3.10+、支持 `claude-code` Mod/function-hooks 的 Claude Code，以及已通过 **ChatGPT 登录**的官方 Codex CLI。本轮在 Windows 的 Claude Code **2.1.314 与 2.1.317** 均运行原生 Hook 测试，并验证 Codex CLI **0.166.0** 的配置与功能；其他宿主版本会显示未验证或未知状态。普通网页 Chat / Cowork 不保证侧栏能力，macOS / Linux 桌面尚未实测。
+需要 Git、Python 3.10+、支持 `claude-code` Mod/function-hooks 的 Claude Code，以及已通过 **ChatGPT 登录**的官方 Codex CLI。Windows 的 Claude Code **2.1.314 与 2.1.317** 已运行原生 Hook 测试，并验证 Codex CLI **0.166.0** 的配置与功能；其他宿主版本会显示未验证或未知状态。普通网页 Chat / Cowork 不保证侧栏能力；macOS 的自动化测试与实际桌面交互分开验证，具体范围见 [macOS 修复记录](docs/MACOS_ISSUE_1.md)。
 
 原生测试框架的 mock 不替生产宿主校验工具结果，本项目另外在原始返回边界检查契约：自注册工具返回 JSON 文本，内置工具拒绝返回 `deny`。测试会故意注入旧版错误对象，确认检查能发现它；测试数不能代替真实桌面对话中的复验。
 
@@ -46,7 +46,11 @@ python scripts/install.py
 
 `python` 可替换为已有解释器完整路径，手工命令也可使用 `py -3`。无需新虚拟环境或第三方 Python 依赖。
 
-安装器先运行不调用模型的 doctor，检查 CLI、所需能力、登录和账号模型目录；不兼容时给出原因并停止，不显示“已就绪”。新登录账号若尚无模型缓存，按 doctor 提示显式刷新目录后重试。`--skip-doctor` 仅用于明确的离线安装/测试，结果会标注未检查，不能等同可运行。
+macOS 系统自带的 Python 3.9 不满足要求。用现有 Python 3.10+ 的完整路径运行安装器（例如 `/opt/homebrew/bin/python3.12 scripts/install.py`，以实际位置为准）。插件在没有显式 `pythonPath` 或 `SAVVY_CODEX_PYTHON` 设置时，会从校验通过的安装记录沿用该解释器；无有效记录才使用平台默认的 python/python3。已有显式设置优先，升级不会覆盖它们。
+
+Codex 优先从 PATH 查找；macOS 还会检查 `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex` 和用户 `~/Applications/ChatGPT.app` 内同一位置。不需要为了插件修改 shell PATH；仍须是官方 CLI、ChatGPT 登录且支持所需能力。应用升级可能改变打包位置，找不到时按 doctor 提示处理。
+
+安装器先检查自身 Python 版本，再运行不调用模型的 doctor，检查 CLI、所需能力、登录和账号模型目录；不兼容时给出原因并停止，不显示“已就绪”。新登录账号若尚无模型缓存，按 doctor 提示显式刷新目录后重试。`--skip-doctor` 仅用于明确的离线安装/测试，结果会标注未检查，不能等同可运行，也不能绕过 Python 最低版本要求。
 
 安装到 `~/.claude/skills/savvy-codex`，仅修改相关插件开关，备份原内容；不更改服务地址、模型或凭据。原 Savvy Flow / Progress 会关闭以避免重复侧栏。重开 Code 会话加载更新。
 
@@ -95,6 +99,8 @@ Claude 子代理的模型覆盖与 worktree 选项以[宿主文档](https://code
 
 失败详情包含可取得的原因分类与下一步。默认不暗中重试、不换模型、不切 API 计费、不绕过权限；瞬时错误最多一次有记录的重试，超时则缩小任务或明确延时。额度/登录/版本问题先处理前置条件。每次新尝试关联原任务，保留原失败记录。
 
+macOS 系统 Git 可能打印 `/tmp/xcrun_db-*` 缓存权限诊断。只有明确成功（退出码 0）的单条 Git/xcrun 命令中的已知缓存行会作为“平台警告”保留在详情和报告；它本身不再将已完成任务判为 blocked。未知/失败退出、其他权限拒绝及无法归属命令的 stderr 仍会阻止交付，不会为消除警告增加沙箱写权限。
+
 记录位于 `~/.claude/codex-worker-runs/`。清理按保留天数处理已结束任务，默认 30 天，先看 dry run；运行中、未知或不安全目录受保护。清理不调用模型，也不创建后台计划。具体命令见 [执行器说明](skills/codex-worker/references/execution.md)。
 
 插件默认只显示 tokens 和用时。上游静态 API 价格估算默认关闭；显式开启 `priceEstimates` 后仍不是订阅账单，不能作为实时价格依据。
@@ -121,7 +127,7 @@ claude plugin validate --json .
 claude plugin test .
 ```
 
-GitHub CI 检查 Windows / Ubuntu 的 Python 3.10、3.12，并安装固定官方 Claude Code 2.1.317 实际运行 `claude plugin test`；共享 JSON 与生成 TS 的一致性也必须通过。CI 不包含账号或模型推理。具备 Codex CLI 的本机可设置 `SAVVY_CLI_INTEGRATION=1` 执行无模型的真实 CLI 配置测试。
+GitHub CI 检查 Windows / Ubuntu / macOS 的 Python 3.10、3.12，在 Ubuntu / macOS 安装固定官方 Claude Code 2.1.317 实际运行 `claude plugin test`，并用真实 Python 3.9 检查安装拒绝；共享 JSON 与生成 TS 的一致性也必须通过。CI 不包含账号或模型推理。具备 Codex CLI 的本机可设置 `SAVVY_CLI_INTEGRATION=1` 执行无模型的真实 CLI 配置测试。
 
 已知宿主限制：预览 API 只提供解码文本，合法 U+FFFD 会保留，无法保证识别宿主静默替换的损坏字节；宿主无法安全解析符号链接时仍拒绝预览，macOS 的 `/var`、`/tmp` 别名请使用解析后的真实路径或用户目录。未提供的上下文窗口容量显示未知。旧记录缺少可信执行副本时只开放报告/JSON/补丁，不会把主项目当前文件当成 worker 的候选文件。
 

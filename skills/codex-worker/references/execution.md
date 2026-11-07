@@ -2,7 +2,9 @@
 
 优先使用已激活流程的原生工具；直接脚本模式只用于明确接受无侧栏的用户，不能用来绕过 off/manual 门禁。
 
-脚本在 `~/.claude/skills/savvy-codex/skills/codex-worker/scripts/codex_delegate.py`。Python 3.10+，标准库即可。原生设置 `pythonPath` 是单个解释器路径或名称（支持空格，不加引号或 `-3` 参数），其次看 SAVVY_CODEX_PYTHON；Windows 默认 python，其他系统 python3。pluginRoot/helperPath 可覆盖安装路径，对应 SAVVY_CODEX_PLUGIN_ROOT / SAVVY_CODEX_HELPER；默认 CLAUDE_PLUGIN_ROOT 或个人 skills-dir。
+脚本在 `~/.claude/skills/savvy-codex/skills/codex-worker/scripts/codex_delegate.py`。Python 3.10+，标准库即可。原生设置 `pythonPath` 是单个解释器路径或名称（支持空格，不加引号或 `-3` 参数），其次看 SAVVY_CODEX_PYTHON，再从当前插件根目录中验证过的 `.install-info.json` 沿用安装器解释器；没有有效记录时 Windows 默认 python，其他系统 python3。显式设置优先，不覆盖用户配置；自定义 helper 与安装目录不匹配时不借用另一安装的记录。macOS 自带 Python 3.9 不受支持，安装时请用实际 Python 3.10+ 完整路径。pluginRoot/helperPath 可覆盖安装路径，对应 SAVVY_CODEX_PLUGIN_ROOT / SAVVY_CODEX_HELPER；默认 CLAUDE_PLUGIN_ROOT 或个人 skills-dir。
+
+CLI 优先从 PATH 查找；macOS 找不到时检查系统及用户 Applications 下 ChatGPT.app 内的 `Contents/Resources/codex-cli/bin/codex`，仍执行官方 CLI 能力与 ChatGPT 登录检查。不修改 PATH 或认证。
 
 在仓库目录内：
 
@@ -43,6 +45,8 @@ run/start 需要 --workspace、--packet、--model、--effort，模型/effort 必
 短时预检缓存省去重复的 CLI 静态功能查询；每次仍读取实际沙箱策略。Windows 状态读取允许删除共享，写入使用有界重试与原子替换，进度写入暂时冲突不会杀掉模型进程。不要把状态文件不见或写入警告当成模型已经完成。
 
 start 返回任务编号，status 读真实状态，wait 用程序等待，不应让模型循环查询。失败保持原记录；后续尝试记录 parent_job、attempt，独立审查记录 review_of 与 author_provider。详细字段与参数以脚本 --help 和工具 schema 为准。
+
+`platform_warnings` 保留已知平台诊断，详情与报告可查看原文。当前只豁免 Darwin 下明确成功且退出码 0 的单条 Git/xcrun 命令中的精确 xcrun_db 缓存行；失败/未知退出、混合真实拒绝、其他命令和无法归属的 stderr 不豁免。它不改变必需工具验证或只读沙箱权限。
 
 Claude 中可以运行 `/savvy-check`，它通过当前宿主实际调用注册的 status/catalog 工具并检查 JSON 文本返回，不派工也不调用模型。主工具按需发现。阶段计划请使用稳定 plan_task_id 和短 title；goal 保留完整任务，不靠整句目标匹配短标题。
 

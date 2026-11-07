@@ -122,6 +122,7 @@ export type CodexJob = {
   lastMessage: string
   changedFiles: string[]
   readError: string
+  platformWarnings?: string[]
   authenticationVerified: boolean
   tokens?: number
   result?: CodexResult

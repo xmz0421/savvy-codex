@@ -143,9 +143,19 @@ def read_receipt(path: Path) -> tuple[bytes | None, dict | None]:
     return original, receipt
 
 
-def doctor_preflight(source: Path) -> dict:
+def require_supported_python() -> None:
+    """Check the installer's runtime before inspecting any installation path."""
     if sys.version_info < (3, 10):
-        raise NotReadyError("Python 3.10 or later is required")
+        version = ".".join(str(part) for part in sys.version_info[:3])
+        raise NotReadyError(
+            f"Python 3.10 or later is required; running Python {version} ({sys.executable}). "
+            "Rerun this installer with an absolute path to a Python 3.10+ interpreter, "
+            "for example: /absolute/path/to/python3.10 scripts/install.py"
+        )
+
+
+def doctor_preflight(source: Path) -> dict:
+    require_supported_python()
     helper = source / "skills" / "codex-worker" / "scripts" / "codex_delegate.py"
     if not helper.is_file():
         raise NotReadyError(f"Bundled doctor is missing: {helper}")
@@ -297,6 +307,7 @@ def finish_backup(backup: Path, claude_home: Path, keep_backups: int) -> list[st
 
 
 def install(source: Path, claude_home: Path, enable_default_workflow: bool = False, *, skip_doctor: bool = False, keep_backups: int = 5) -> dict:
+    require_supported_python()
     if type(keep_backups) is not int or keep_backups < 0:
         raise ValueError("keep_backups must be a nonnegative integer")
     source, claude_home = absolute(source), absolute(claude_home)

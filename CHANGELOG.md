@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.1-codex.1
+
+- Repair macOS issue #1: exact xcrun cache diagnostics from successful, explicitly identified Git/xcrun commands are retained as visible platform warnings instead of blocking otherwise valid results. Real denials, unknown/nonzero exits, unrelated commands and unscoped stderr remain blocking; read-only permissions stay unchanged.
+- Discover the official CLI inside system/user ChatGPT.app installations after PATH lookup, without changing PATH or copying login data.
+- Reject Python below 3.10 before installation changes even with `--skip-doctor`. Reuse the installer interpreter from a validated local receipt when no explicit Python setting or environment override exists.
+- Canonicalize controlled installer test roots on macOS while preserving production symlink guards. Add macOS Python/native Hook CI and a real Python 3.9 rejection job.
+
 ## 1.5.0-codex.2
 
 - `/savvy-start [task]` immediately opens/focuses the existing Agents pane, eliminating the second command in normal use. Empty starts open the pane without inference; placement failures remain visible and preserve the task.

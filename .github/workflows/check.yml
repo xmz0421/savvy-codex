@@ -7,7 +7,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         python: ['3.10', '3.12']
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
@@ -20,7 +20,11 @@ jobs:
       - run: python -m unittest discover -s skills/codex-worker/scripts -p "test_*.py"
       - run: python -m unittest discover -s tests -p "test_*.py"
   native-hooks:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     env:
       # Deliberately pinned. Update with a verified native-host test run.
@@ -39,3 +43,41 @@ jobs:
       # This uses the CLI's real mod test runtime; no login or model call.
       # Missing CLI/runtime and failing tests must fail this job.
       - run: claude plugin test .
+  unsupported-python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      # Use the actual unsupported runtime, without importing worker modules or
+      # mocking sys.version_info. Both install modes must refuse before mkdir.
+      - name: Python 3.9 cannot install even with doctor skipped
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pathlib
+          import subprocess
+          import sys
+          import tempfile
+
+          assert sys.version_info[:2] == (3, 9), sys.version
+          with tempfile.TemporaryDirectory() as temporary:
+              root = pathlib.Path(temporary).resolve()
+              home = root / "new-claude-home"
+              base = [sys.executable, "scripts/install.py", "--claude-home", str(home)]
+              for extra in ([], ["--skip-doctor"]):
+                  result = subprocess.run(base + extra, capture_output=True, text=True)
+                  assert result.returncode == 2, (extra, result.returncode, result.stdout, result.stderr)
+                  assert "running Python 3.9." in result.stderr, result.stderr
+                  assert "absolute path" in result.stderr and "3.10+" in result.stderr, result.stderr
+                  assert not home.exists(), str(home)
+                  assert not result.stdout, result.stdout
+                  print("Python 3.9 refused install before creating home:", extra)
+              help_result = subprocess.run(base + ["--help"], capture_output=True, text=True)
+              assert help_result.returncode == 0, help_result.stderr
+              uninstall_result = subprocess.run(base + ["--uninstall"], capture_output=True, text=True)
+              assert uninstall_result.returncode == 0, uninstall_result.stderr
+              assert not home.exists(), str(home)
+          PY
