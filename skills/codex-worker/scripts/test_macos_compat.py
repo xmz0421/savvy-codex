@@ -264,7 +264,11 @@ class MacCompatibilityTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("git version", result.stdout)
         evidence = self.evidence(self.event(output=result.stdout + result.stderr))
-        self.assertEqual(self.assess(evidence)["status"], "complete")
+        assessment = self.assess(evidence)
+        diagnostics = json.dumps({"assessment": assessment, "stdout": result.stdout,
+                                  "stderr": result.stderr, "denials": evidence["denials"]},
+                                 ensure_ascii=False, indent=2)
+        self.assertEqual(assessment["status"], "complete", diagnostics)
         # Demonstrate that the profile still rejects writes.
         forbidden = self.root / "forbidden.txt"
         denied = subprocess.run(["/usr/bin/sandbox-exec", "-p", profile, "/bin/sh", "-c", 'printf forbidden > "$1"', "sh", str(forbidden)],
